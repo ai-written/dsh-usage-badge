@@ -1,0 +1,6 @@
+# Keep the repository in LF, so the same commit checked out on Windows, Linux and
+# macOS produces identical bytes and no whole-file line-ending diffs.
+* text=auto eol=lf
+
+# Screenshots are not text.
+*.png binary

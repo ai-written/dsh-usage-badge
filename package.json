@@ -1,0 +1,54 @@
+{
+  "name": "dsh-usage-badge",
+  "version": "0.1.0",
+  "description": "DeepSeek Harness 用量徽标插件：左下角 ¥ 胶囊显示当日估算费用，点击查看 24 小时 / 近 7 日 / 近 30 日 / 近 12 个月用量与金额，按 provider 筛选。只读 DSH 会话日志，价格表沿用 $DSH_HOME/storages/usage-pricing.json。A lean cost badge plugin for DeepSeek Harness: a ¥ pill showing today's estimated spend, with 24h / 7d / 30d / 12-month charts.",
+  "type": "module",
+  "main": "lib/index.js",
+  "exports": {
+    ".": {
+      "default": "./lib/index.js"
+    },
+    "./client": {
+      "default": "./lib/client.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "dsh": {
+    "manifestVersion": 1,
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web"
+    }
+  },
+  "files": [
+    "lib",
+    "cordis.patch.yml",
+    "README.md",
+    "LICENSE",
+    "assets",
+    "docs"
+  ],
+  "scripts": {
+    "test": "node test/manifest.verify.mjs && node test/pricing.verify.mjs && node test/holidays.verify.mjs && node test/official-pricing.verify.mjs && node test/client.render.mjs",
+    "test:smoke": "node test/smoke.mjs"
+  },
+  "engines": {
+    "node": ">=22.15"
+  },
+  "keywords": [
+    "dsh",
+    "dsh-plugin",
+    "deepseek-harness",
+    "usage",
+    "cost",
+    "badge",
+    "billing"
+  ],
+  "license": "MIT",
+  "devDependencies": {
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1"
+  }
+}

@@ -1,0 +1,7 @@
+# dsh-usage-badge bundle patch: one host row over whichever profile selects
+# this bundle. The row name resolves from the profile's own node_modules, where
+# `dsh plugin --profile web add <path-or-package>` installed this package, so it
+# must stay equal to `package.json.name`.
+- insert:
+    - id: usage-badge
+      name: dsh-usage-badge
