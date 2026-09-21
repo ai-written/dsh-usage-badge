@@ -1,3 +1,6 @@
 node_modules/
 *.log
 .tmp/
+
+# npm pack 的产物（发布走 CI，本地一般只用 --dry-run）
+*.tgz

@@ -11,6 +11,10 @@ DeepSeek Harness 的用量徽标插件：侧边栏底部一行「今日用量」
 需要 Node ≥ 22.15，以及带 `dsh plugin` 命令的 DSH。
 
 ```sh
+# 从 npm 安装
+dsh plugin --profile web add dsh-usage-badge
+
+# 或者从本地源码路径安装（把 <本仓库路径> 换成实际路径）
 dsh plugin --profile web add <本仓库路径>
 ```
 

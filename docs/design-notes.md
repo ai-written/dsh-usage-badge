@@ -255,6 +255,39 @@ npm test
 - 用本插件：`dsh web` / 官方桌面客户端 / CLI 都有徽标，壳里那套约 2800 行可以删掉。
 - 用桌面壳：保留 sidecar 的故障隔离（插件跑在宿主进程内，出问题影响的是整个 DSH；sidecar 崩了只写日志），但计时口径偏松。
 
+## 发布到 npm
+
+工作流在 [`.github/workflows/publish.yml`](../.github/workflows/publish.yml)：推 `v*` tag 触发，也可以手动触发（默认只预演）。
+
+**认证用 Trusted Publishing（OIDC），不需要任何 secret。** 这是 npm 现在的推荐做法 —— 长驻 token 这条路已经走不通了：
+
+- npm 从 2025 年 11 月起**只支持 Granular access tokens，Classic（含 Automation）token 已被撤销并停止生成**。所以"在 npm 上生成一个 Automation token 塞进 GitHub Secrets"这个老办法已经不适用。
+- 新建的**可写 granular token 默认 7 天过期、最长 90 天**，放进 CI secret 就得不断轮换，不适合"配一次跑一年"的发布。
+- Trusted Publishing 由 npm 校验「哪个仓库的哪个 workflow」来授权，每次发布换一次短期凭据，并且**自动附带 provenance 签名**（不需要 `--provenance`）。
+
+### 配置步骤
+
+1. **先让包存在**：Trusted Publisher 是配在**包设置页**上的，所以全新包必须先发一次 —— 本地 `npm login` 后 `npm publish --access public`（会走你账号的 2FA）。
+2. **在 npmjs.com 配 Trusted Publisher**：进该包的 Settings → Trusted Publisher → 选 GitHub Actions，填四个字段：
+   - Organization or user：你的 GitHub 账号
+   - Repository：仓库名
+   - Workflow filename：`publish.yml`（**只填文件名**，必须带 `.yml`，大小写敏感）
+   - Allowed actions：**勾上允许直接 `npm publish`**（默认只允许 `npm stage publish`，不勾就直接发不出去）
+3. **`package.json` 的 `repository.url` 必须与 GitHub 仓库完全一致** —— 这是 npm 的硬性要求，不匹配会拒绝发布。
+4. 之后每次发版：改 `package.json` 的 `version` → 提交 → `git tag v0.1.1 && git push origin dev --tags`。
+
+### 需要知道的坑
+
+- **npm 不会在保存时校验** Trusted Publisher 配置：字段填错只在**发布时**以 `ENEEDAUTH`（Unable to authenticate）报出来。
+- 必须用 **GitHub 托管的 runner**（`ubuntu-latest` 这类），自托管 runner 不支持。
+- 私有仓库**不会**生成 provenance（即使包本身是公开的）。
+- Trusted Publishing 要求 **npm CLI ≥ 11.5.1 + Node ≥ 22.14**，所以工作流里用的是 Node 24。
+- 每个包最多 10 个 trusted publisher，且**已配好的不能修改**，要改只能删掉重建。
+
+### 如果一定要用 token
+
+只能用 granular token：Access Tokens → Generate New Token → `Bypass two-factor authentication`（按需）→ Packages and scopes 选 `Read and write (publish and stage)` 并指明这个包 → 生成后放进仓库的 `NPM_TOKEN` secret，同时在工作流的发布步骤上补回 `env: NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}`。注意它会过期（最长 90 天）。更安全的替代是 `Read and write (stage only)`：CI 只能**暂存**版本，由维护者用 2FA 审核提升。
+
 ## License
 
 MIT

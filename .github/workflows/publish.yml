@@ -1,0 +1,58 @@
+name: publish
+
+# 推 v* tag 发布到 npm；也可手动触发（默认只预演，不发布）。
+# 认证用 npm Trusted Publishing（OIDC），不需要任何 secret —— 配置步骤见 docs/design-notes.md。
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      dry-run:
+        description: 只跑测试与打包清单，不发布
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+  id-token: write # 换 OIDC 发布凭据
+
+concurrency:
+  group: publish-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '24' # Trusted Publishing 要求 npm >= 11.5.1
+          registry-url: https://registry.npmjs.org
+          package-manager-cache: false # 发布构建不缓存
+
+      # 版本号发出去收不回来，先确认 tag 与 package.json 对得上
+      - name: 校验 tag 与 package.json 版本
+        if: startsWith(github.ref, 'refs/tags/')
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          version="$(node -p "require('./package.json').version")"
+          echo "tag=v$tag   package.json=$version"
+          if [ "$tag" != "$version" ]; then
+            echo "::error::tag v$tag 与 package.json 的 $version 不一致：先改版本号，再打 tag"
+            exit 1
+          fi
+
+      - run: npm ci
+
+      - name: 预演（测试 + 打包清单）
+        if: github.event_name == 'workflow_dispatch' && inputs.dry-run
+        run: |
+          npm test
+          npm pack --dry-run
+
+      # prepublishOnly 会先跑一遍测试；provenance 由 OIDC 自动附带，无需 --provenance
+      - name: 发布
+        if: github.event_name != 'workflow_dispatch' || !inputs.dry-run
+        run: npm publish --access public
