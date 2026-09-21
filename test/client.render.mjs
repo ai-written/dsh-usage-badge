@@ -331,6 +331,15 @@ check('config panel has an apply action', configMarkup.includes('应用官方价
 check('config panel has no editable rate or price fields', !configMarkup.includes('<input'), 'no <input> in the panel')
 check('config panel no longer offers a total-currency choice', !configMarkup.includes('合计币种'))
 check('config panel names the published list as the only price source', configMarkup.includes('这是唯一的单价来源'))
+// Switching tabs unmounts the panel, so returning to it must render the list it
+// already fetched rather than blanking it back to the loading placeholder — that
+// swap is the flicker. The cache lives for the life of the page.
+check('the config panel seeds itself from the last successful fetch',
+  /useState\(initialOfficial \?\? cachedOfficial\)/.test(clientSource) &&
+    /useState\(initialConfig \?\? cachedConfig\)/.test(clientSource))
+check('a refresh only shows the loading line when there is nothing to show',
+  /if \(!cachedOfficial\) setOfficialState\('loading'\)/.test(clientSource))
+check('a failed refresh keeps the last good list', /if \(!cachedOfficial\) setOfficial\(null\)/.test(clientSource))
 
 // The published list itself, with the numbers the page quotes.
 check('official table lists the published models',
@@ -387,12 +396,40 @@ check('sparse provider keeps the four series', (sparseMarkup.match(/<path[^>]*st
 
 // Day rows carrying a holiday mark must shade the chart, which is how it explains
 // a cheap day. The mark only exists on the day ranges (the 24-hour view has no day
-// rows) and the range is panel state, so this asserts the wiring in the bundle
-// rather than rendering a state the props cannot reach.
+// rows).
 check('day rows carry their class into the chart points',
   /const point = \(label, title, src, dayClass\)/.test(clientSource) &&
     /entryTotals\(day, provider\),[\s\S]{0,40}day\.dayClass,/.test(clientSource))
 check('holiday days shade the chart', /p\.dayClass === 'holiday'/.test(clientSource) && /dub-band-holiday/.test(clientSource))
+
+// ── 9. the ranges are calendar windows, not "the last N days with usage" ─────
+// The fixture has usage on today and on days -1, -2, -3 and -10. A window built
+// from the days that have data would draw 5 points spanning 11 calendar days, so a
+// quiet Saturday silently stretches 近 7 日 into 8 or more days and hides the gap.
+// Enumerating the calendar keeps every day in its own slot, zeros included.
+{
+  const axisLabels = (markup) => [...markup.matchAll(/class="dub-axis"[^>]*>([^<]+)</g)].map((match) => match[1])
+  const dayKey = (offset) => {
+    const date = new Date()
+    date.setDate(date.getDate() + offset)
+    return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}-${String(date.getDate()).padStart(2, '0')}`
+  }
+
+  const week = render({ initialSnapshot: snapshot, initialOpen: true, initialRange: '7d' })
+  const weekLabels = axisLabels(week)
+  const expected = [-6, -5, -4, -3, -2, -1, 0].map((offset) => dayKey(offset).slice(5))
+  check('7d draws exactly 7 slots', weekLabels.length === 7, weekLabels.join(' '))
+  check('7d covers 7 consecutive calendar days ending today',
+    weekLabels.join(',') === expected.join(','), `${weekLabels.join(',')} vs ${expected.join(',')}`)
+  // Day -4 has no usage in the fixture and must still occupy its slot.
+  check('7d keeps a day with no usage in its slot', weekLabels.includes(dayKey(-4).slice(5)), dayKey(-4))
+  check('7d does not reach past the window', !weekLabels.includes(dayKey(-10).slice(5)), dayKey(-10))
+  check('7d draws a point per day and series', (week.match(/<circle/gi) || []).length === 7 * 4)
+
+  const year = render({ initialSnapshot: snapshot, initialOpen: true, initialRange: '12m' })
+  const monthLabels = axisLabels(year)
+  check('12m draws twelve calendar months', monthLabels.length === 12, monthLabels.join(' '))
+}
 check('there is no 调休 shading', !/dub-band-makeup/.test(clientSource))
 
 // ── 9. verdict ───────────────────────────────────────────────────────────────

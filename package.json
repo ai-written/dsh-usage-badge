@@ -1,6 +1,6 @@
 {
   "name": "dsh-usage-badge",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "DeepSeek Harness 的用量徽标插件：侧边栏底部一行显示当天的 token 总量与估算费用，点开可看 24 小时 / 近 7 日 / 近 30 日 / 近 12 个月用量，按 provider 筛选，并按 DeepSeek 官方定价与中国法定节假日计价。A usage badge plugin for DeepSeek Harness: today's tokens and estimated spend in the sidebar, with 24h / 7d / 30d / 12-month charts, official DeepSeek pricing and Chinese public holidays.",
   "type": "module",
   "main": "lib/index.js",
