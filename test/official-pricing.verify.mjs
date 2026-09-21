@@ -68,6 +68,33 @@ const en = parseOfficialPricing(fixture('en'), { url: 'https://api-docs.deepseek
   check('en: windows convert into the host zone', JSON.stringify(en.policy.peakRangesLocal) === '[[9,12],[14,18]]', JSON.stringify(en.policy.peakRangesLocal))
 }
 
+// ── 2b. the same windows in other host zones ─────────────────────────────────
+// The suite pins the host to Asia/Shanghai (see test/all.mjs), so a host offset is
+// passed in explicitly here: what is under test is the conversion, not where the
+// suite happens to run.
+{
+  const url = 'https://api-docs.deepseek.com/quick_start/pricing'
+  const windows = (offset) => parseOfficialPricing(fixture('en'), { url, localOffsetMinutes: offset }).policy.peakRangesLocal
+
+  check('zone: a UTC host keeps the printed hours', JSON.stringify(windows(0)) === '[[1,4],[6,10]]', JSON.stringify(windows(0)))
+  check('zone: a Beijing host shifts by +8', JSON.stringify(windows(480)) === '[[9,12],[14,18]]', JSON.stringify(windows(480)))
+  check('zone: a UTC+1 host shifts by +1', JSON.stringify(windows(60)) === '[[2,5],[7,11]]', JSON.stringify(windows(60)))
+  // A window pushed wholly before midnight has to wrap as a unit. The bug this pins:
+  // 01:00–04:00 UTC is 20:00–23:00 in a UTC-5 host, but splitting it at midnight
+  // emitted [0,23] — nearly the entire day billed at peak rates.
+  check('zone: a UTC-5 host wraps without inventing a range', JSON.stringify(windows(-300)) === '[[1,5],[20,23]]', JSON.stringify(windows(-300)))
+  check('zone: a UTC-4 host emits no empty range', JSON.stringify(windows(-240)) === '[[2,6],[21,24]]', JSON.stringify(windows(-240)))
+  // 06:00–10:00 UTC is 22:00–02:00 in a UTC-8 host: the one case that genuinely splits.
+  check('zone: a UTC-8 host splits the straddling window', JSON.stringify(windows(-480)) === '[[0,2],[17,20],[22,24]]', JSON.stringify(windows(-480)))
+
+  // However the windows move, they must still cover the same number of hours.
+  const offsets = [480, 0, 60, -240, -300, -480, -720, 720]
+  const hours = (offset) => windows(offset).reduce((total, [from, to]) => total + (to - from), 0)
+  check('zone: every host keeps the same total peak hours',
+    offsets.every((offset) => hours(offset) === 7),
+    offsets.map((offset) => `${offset}:${hours(offset)}`).join(' '))
+}
+
 // ── 3. the parser fails loudly on a changed page ─────────────────────────────
 {
   for (const [label, html] of [

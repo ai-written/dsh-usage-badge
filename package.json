@@ -39,7 +39,7 @@
     "docs"
   ],
   "scripts": {
-    "test": "node test/manifest.verify.mjs && node test/pricing.verify.mjs && node test/holidays.verify.mjs && node test/official-pricing.verify.mjs && node test/client.render.mjs",
+    "test": "node test/all.mjs",
     "test:smoke": "node test/smoke.mjs",
     "prepublishOnly": "npm test"
   },
