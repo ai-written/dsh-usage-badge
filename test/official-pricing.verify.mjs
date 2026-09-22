@@ -133,6 +133,20 @@ const en = parseOfficialPricing(fixture('en'), { url: 'https://api-docs.deepseek
   check('apply: a hand-written override survives', document.overrides['my-custom-model']?.inputPerMillion === 5)
   check('apply: an unknown top-level key survives', document.someUnknownKey?.keep === 'me')
   check('apply: the default row is left alone', document.default.inputPerMillion === 99)
+
+  // A table with no default row used to be priced by the built-in template, whose rates are
+  // nobody's choice. Applying now fills that gap from the published list's first line, and
+  // the page leads with its cheapest model — that ordering is the assumption being pinned
+  // here, because a reordered page would silently change what an unmatched model costs.
+  check('apply: the published list leads with its cheapest model',
+    zh.models[0]?.model === 'deepseek-flash', zh.models.map((entry) => entry.model).join(' -> '))
+  const filled = applyOfficialPricing({ exchangeRate: 6.74, totalCurrency: 'cny', overrides: {} }, zh)
+  check('apply: a table with no default row gets one from the first published line',
+    filled.document.default?.inputPerMillion === 1 && filled.document.default?.cacheReadPerMillion === 0.02 &&
+      filled.document.default?.outputPerMillion === 4 && filled.applied.defaultFrom === 'deepseek-flash',
+    JSON.stringify(filled.document.default))
+  check('apply: a table that already has a default row reports no fill',
+    applied.defaultFrom === null, JSON.stringify(applied.defaultFrom))
 }
 
 // ── 5. the routes, with the network stubbed out ──────────────────────────────
@@ -172,6 +186,8 @@ const en = parseOfficialPricing(fixture('en'), { url: 'https://api-docs.deepseek
     const written = readPricing(root)
     check('route: the applied prices are on disk', written.overrides['deepseek-flash']?.inputPerMillion === 1, JSON.stringify(written.overrides['deepseek-flash']))
     check('route: the applied policy is on disk', written.timeOfUse?.peakMultiplier === 2 && written.holidays?.source === 'cn', JSON.stringify({ t: written.timeOfUse, h: written.holidays }))
+    check('route: a default row that was already there is still left alone',
+      written.default?.inputPerMillion === 99 && applied.body.applied?.defaultFrom === null, JSON.stringify(written.default))
 
     // ── 6. the applied prices actually bill ───────────────────────────────────
     // 2026-09-24 is an ordinary Thursday, so this is deterministic regardless of
@@ -227,6 +243,61 @@ const en = parseOfficialPricing(fixture('en'), { url: 'https://api-docs.deepseek
     check('apply-base: the stale file is not used as a base', written.overrides['official-only'] === undefined, Object.keys(written.overrides).join(','))
     check('apply-base: the exchange rate is preserved', written.exchangeRate === 6.74, String(written.exchangeRate))
     check('apply-base: the total currency is preserved', written.totalCurrency === 'cny', String(written.totalCurrency))
+  } finally {
+    globalThis.fetch = realFetch
+  }
+}
+
+// ── 8. what an unmatched model costs once the gap has been filled ────────────
+// A table with no default row of its own: applying fills it from the published list's first
+// line, and from then on an unlisted model is billed at that line rather than at the
+// template's invented rates. 1M input tokens off-peak at the flash rate of 1 CNY/M is 1 CNY;
+// the template would have said 1.5.
+{
+  const root = makeHome('apply-default')
+  writePricing(root, { exchangeRate: 6.74, totalCurrency: 'cny', overrides: {} })
+
+  const realFetch = globalThis.fetch
+  globalThis.fetch = async () => ({ ok: true, status: 200, text: async () => fixture('zh') })
+  try {
+    const instance = await mount(root, 'apply-default')
+    const applied = await instance.call('POST', '/usage-badge/official-pricing/apply', { source: 'zh-cn' })
+    check('apply-default: the response names the model the default row came from',
+      applied.body.applied?.defaultFrom === 'deepseek-flash', JSON.stringify(applied.body.applied))
+    check('apply-default: the filled default row is on disk',
+      readPricing(root).default?.inputPerMillion === 1 && readPricing(root).default?.outputPerMillion === 4,
+      JSON.stringify(readPricing(root).default))
+
+    writeSession(root, 'unknown', { provider: 'p', model: 'some-unlisted-model', time: at(2026, 9, 24, 20, 30), input: 1e6 })
+    const snapshot = await summaryFor(root, 'apply-default-billing')
+    const day = snapshot.days.find((row) => row.date === '2026-09-24')
+    check('apply-default: an unlisted model is billed at the first published line',
+      close(day?.amount, 1), `got ${day?.amount}`)
+
+    // The lifecycle the panel offers: delete the row, fall back to the template, regenerate it
+    // from the official list. Each step is asserted, because "delete then get it back" is the
+    // whole reason the row is deletable in the first place.
+    const removed = await instance.call('PUT', '/usage-badge/config', { default: null })
+    check('apply-default: deleting the row removes it from the table',
+      removed.status === 200 && readPricing(root).default === undefined, JSON.stringify(readPricing(root).default))
+    const afterRemove = await instance.call('GET', '/usage-badge/config')
+    check('apply-default: the table falls back to the built-in template and says so',
+      afterRemove.body.defaultSource === 'template' && afterRemove.body.effective.default?.inputPerMillion === 1.5,
+      JSON.stringify({ source: afterRemove.body.defaultSource, row: afterRemove.body.effective.default }))
+    const regenerated = await instance.call('POST', '/usage-badge/official-pricing/apply', { source: 'zh-cn' })
+    check('apply-default: applying again regenerates it from the first published line',
+      regenerated.body.applied?.defaultFrom === 'deepseek-flash' && readPricing(root).default?.inputPerMillion === 1,
+      JSON.stringify(readPricing(root).default))
+
+    // The other way in is the editor, and what it writes survives an apply — apply only ever
+    // fills the *absence* of a default row.
+    await instance.call('PUT', '/usage-badge/config', {
+      default: { inputPerMillion: 3, cacheReadPerMillion: 0.3, cacheWritePerMillion: 0, outputPerMillion: 9, currency: 'cny' },
+    })
+    const edited = await instance.call('POST', '/usage-badge/official-pricing/apply', { source: 'zh-cn' })
+    check('apply-default: a hand-edited default row survives an apply',
+      readPricing(root).default?.inputPerMillion === 3 && edited.body.applied?.defaultFrom === null,
+      JSON.stringify(readPricing(root).default))
   } finally {
     globalThis.fetch = realFetch
   }

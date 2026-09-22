@@ -13,6 +13,9 @@ import { join } from 'node:path'
 
 const homes = []
 
+/** Disposers of every mounted plugin, so a home's files are not held open when it is removed. */
+const disposers = []
+
 /** A fresh throwaway harness home with a `storages` directory. */
 export function makeHome(prefix) {
   const root = mkdtempSync(join(tmpdir(), `dsh-usage-badge-${prefix}-`))
@@ -21,8 +24,20 @@ export function makeHome(prefix) {
   return root
 }
 
-/** Remove every home this process created. */
+/**
+ * Dispose every mounted plugin, then remove every home this process created.
+ *
+ * The order matters on Windows: a mounted plugin holds its cache file open, and an open handle
+ * makes the directory undeletable.
+ */
 export function cleanupHomes() {
+  for (const dispose of disposers.splice(0)) {
+    try {
+      dispose()
+    } catch {
+      // A failing disposer must not stop the cleanup.
+    }
+  }
   for (const root of homes.splice(0)) rmSync(root, { recursive: true, force: true })
 }
 
@@ -101,7 +116,10 @@ export async function mount(root, scenario) {
       },
       effect(body) {
         const dispose = body()
-        return typeof dispose === 'function' ? dispose : () => {}
+        // Held rather than dropped: the cache store keeps a file handle open, and on Windows a
+        // home with an open handle cannot be deleted — which is what `cleanupHomes` does.
+        if (typeof dispose === 'function') disposers.push(dispose)
+        return () => {}
       },
     })
     const route = routes[0]

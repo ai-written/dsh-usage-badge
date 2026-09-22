@@ -21,6 +21,7 @@ const SUITES = [
   './pricing.verify.mjs',
   './holidays.verify.mjs',
   './official-pricing.verify.mjs',
+  './cache.verify.mjs',
   './client.render.mjs',
 ]
 
