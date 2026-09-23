@@ -156,6 +156,19 @@ check('the row does not float over other controls', !/\.dub-pill\{[^}]*position:
 check('the rail variant is a square', /\.dub-pill-rail\{[^}]*width:36px;height:36px/.test(clientSource))
 check('dialog sits above the frame', /\.dub-mask\{[^}]*z-index:2147483/.test(clientSource))
 check('the chart tooltip has its own positioned layer', /\.dub-plot\{position:relative\}/.test(clientSource))
+// The bug this pins: DSH 0.1.7 changed --dsw-specific-menu from
+// var(--dsw-alias-bg-layer-3) — an opaque surface, which is what 0.1.6 defined — to
+// #f8f9fa94 in the light theme and #30313680 in the dark one. Those are frosted
+// surfaces: the shell pairs them with backdrop-filter:var(--dsw-menu-backdrop-filter),
+// so a rule that fills with the token and no blur reads as half transparent — the
+// dialog panel and the chart tooltip let the conversation behind them show through.
+// Both name the opaque layer token directly instead, which both versions define.
+check('the dialog panel keeps an opaque surface',
+  /\.dub-box\{[^}]*background:var\(--dsw-alias-bg-layer-3,#fff\)/.test(clientSource))
+check('the chart tooltip keeps an opaque surface',
+  /\.dub-tip\{[^}]*background:var\(--dsw-alias-bg-layer-3,#fff\)/.test(clientSource))
+check('no surface fills with the translucent menu token',
+  !/background:var\(--dsw-specific-menu/.test(clientSource), 'menu surfaces need a backdrop blur')
 
 // The row reports the day's token total, and keeps the compact peak/valley dot —
 // which now carries the band text as its own tooltip so it explains itself.
