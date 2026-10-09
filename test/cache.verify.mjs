@@ -20,6 +20,7 @@ import { createHash } from 'node:crypto'
 import { join } from 'node:path'
 
 import { CACHE_WINDOW_DAYS, createCacheStore } from '../lib/cache-store.js'
+import { rowKind } from '../lib/buckets.js'
 import { createChecker, makeHome, mount, summaryFor, writePricing, writeSession } from './helpers.mjs'
 
 const { check, finish } = createChecker('CACHE VERIFY')
@@ -121,12 +122,14 @@ for (const kind of ['sqlite', 'json']) {
       check('json: the whole document comes back, window or not', session?.days.get(ancient)?.get('p|m')?.input === 42)
     }
 
-    // A session is written as a whole: a day the log no longer has disappears with it, which is
-    // the same semantics the single-document cache always had.
-    store.put(recordOf('s1', [[today, [['p|m', bucket('p', 'm', 5, 5)]]]]))
+    // A session is written as a whole: a day a **fuller** log no longer has disappears with it —
+    // the same semantics the single-document cache always had. The stamp has to be fuller for that
+    // to apply, which is the distinction the row model introduces (see section 8): an equal or
+    // weaker rewrite is a rollback, not a deletion.
+    store.put(recordOf('s1', [[today, [['p|m', bucket('p', 'm', 5, 5)]]]], { fileSize: 200, seq: 9 }))
     store.flush()
     const after = store.load().find((row) => row.sessionId === 's1')
-    check(`${kind}: rewriting a session replaces its day set`, after?.days.get(today)?.get('p|m')?.input === 5 && after?.days.has(recent) === false, [...(after?.days.keys() ?? [])].join(','))
+    check(`${kind}: a fuller rewrite replaces its day set`, after?.days.get(today)?.get('p|m')?.input === 5 && after?.days.has(recent) === false, [...(after?.days.keys() ?? [])].join(','))
     store.close()
   }
 }
@@ -214,7 +217,7 @@ for (const kind of ['sqlite', 'json']) {
   const seed = new DatabaseSync(join(dir, 'cache.sqlite'))
   seed.exec(
     `CREATE TABLE sessions (id TEXT PRIMARY KEY, path TEXT NOT NULL, file_size INTEGER NOT NULL, file_mtime_ms REAL NOT NULL, seq INTEGER NOT NULL, provider TEXT, model TEXT);
-     CREATE TABLE days (session_id TEXT NOT NULL, date TEXT NOT NULL, payload TEXT NOT NULL, PRIMARY KEY (session_id, date)) WITHOUT ROWID;
+     CREATE TABLE days (session_id TEXT NOT NULL, date TEXT NOT NULL, source TEXT NOT NULL, kind TEXT NOT NULL, seq INTEGER NOT NULL, file_size INTEGER NOT NULL, file_mtime_ms REAL NOT NULL, at REAL NOT NULL, payload TEXT NOT NULL, PRIMARY KEY (session_id, date, source, kind)) WITHOUT ROWID;
      PRAGMA user_version = 99;`,
   )
   seed.close()
@@ -599,6 +602,139 @@ for (const kind of ['sqlite', 'json']) {
     Number.isFinite(daysKept) && CACHE_WINDOW_DAYS > daysKept,
     `window ${CACHE_WINDOW_DAYS} calendar days vs DAYS_KEPT ${daysKept} usage days`,
   )
+}
+
+// ── 8. rows: a shortened log does not erase history, and does not bloat either ─────
+//
+// The row model exists for one measured failure and must not introduce a second one:
+//
+//   - a session log that gets shorter (a restored backup, a pruned log, a renamed session
+//     directory) used to rewrite that session's day set smaller, so the cached history shrank with
+//     it — the exact moment the cache is the only copy left;
+//   - "keep every fold" would fix that by storing a full day's per-request records per fold, and a
+//     long-lived session is re-folded every day it is used (~75 KB a time for a thousand requests).
+//
+// So both halves are asserted here, against both backends: the fuller copy survives, and repeated
+// folds of a growing log do not accumulate copies.
+for (const kind of ['sqlite', 'json']) {
+  const root = makeHome(`rows-${kind}`)
+  const dir = storeRoot(root)
+  mkdirSync(dir, { recursive: true })
+  const env = kind === 'json' ? { DSH_USAGE_BADGE_CACHE: 'json' } : {}
+  const day = dayKeyOf(0)
+  const other = dayKeyOf(-3)
+  const store = createCacheStore({ dir, log: () => {}, env })
+
+  const fold = (days, stamp) => {
+    const record = recordOf('s1', days, stamp)
+    const resolved = store.put(record, { source: 'local', at: stamp.fileMtimeMs })
+    return resolved ?? store.load().find((row) => row.sessionId === 's1')
+  }
+  /** The copies the store is actually holding, as rows (what the sync layer would export). */
+  const copies = () => store.scan().find((row) => row.sessionId === 's1')?.rows ?? []
+
+  // A log that grows: the same day, folded ten times with a higher seq and a bigger file.
+  for (let i = 1; i <= 10; i++) {
+    fold([[day, [['p|m', bucket('p', 'm', i * 1000)]]]], { fileSize: i * 1000, fileMtimeMs: i, seq: i })
+  }
+  const grown = store.load().find((row) => row.sessionId === 's1')
+  check(`${kind}: ten folds of a growing log leave one row per day, not ten`, copies().length === 1, `${copies().length} row(s)`)
+  check(`${kind}: ...and the day holds the newest fold`, grown?.days.get(day)?.get('p|m')?.input === 10000, String(grown?.days.get(day)?.get('p|m')?.input))
+
+  // The log is restored from an older backup: same date, smaller file, lower seq.
+  const shorter = fold([[day, [['p|m', bucket('p', 'm', 500)]]]], { fileSize: 500, fileMtimeMs: 11, seq: 3 })
+  check(`${kind}: the shortened fold does not erase the fuller day`, shorter?.days.get(day)?.get('p|m')?.input === 10000, String(shorter?.days.get(day)?.get('p|m')?.input))
+  check(`${kind}: the short fold is kept beside it as a fallback`, copies().length === 2, `${copies().length} row(s)`)
+  check(`${kind}: ...and the resolver picked the fuller one`, copies().filter((row) => row.seq === 10).length === 1)
+
+  // The log comes back: a fuller fold covers both days again and replaces the copies.
+  const restored = fold([[day, [['p|m', bucket('p', 'm', 20000)]]], [other, [['p|m', bucket('p', 'm', 7)]]]], { fileSize: 9000, fileMtimeMs: 99, seq: 40 })
+  check(
+    `${kind}: a fuller log replaces the fallback copies`,
+    restored?.days.get(day)?.get('p|m')?.input === 20000 && restored?.days.get(other)?.get('p|m')?.input === 7,
+    `day ${restored?.days.get(day)?.get('p|m')?.input}, other ${restored?.days.get(other)?.get('p|m')?.input}`,
+  )
+  check(`${kind}: ...and the short fold's copy is still held as a fallback`, copies().length === 3, `${copies().length} row(s)`)
+
+  // The log trims a day away while still growing: a *fuller* fold whose day set no longer has it.
+  // That day is genuinely gone from the log, so this device's row for it goes.
+  const trimmed = fold([[other, [['p|m', bucket('p', 'm', 7)]]]], { fileSize: 12000, fileMtimeMs: 130, seq: 50 })
+  check(`${kind}: a day a fuller log no longer covers is dropped`, trimmed?.days.has(day) === false && trimmed?.days.has(other) === true, [...(trimmed?.days.keys() ?? [])].join(','))
+
+  // Whereas a *shorter* fold that drops a day is indistinguishable from a restored backup, so the
+  // day it cannot see is kept rather than deleted — this is the whole point of the row model.
+  fold([[day, [['p|m', bucket('p', 'm', 20000)]]]], { fileSize: 12000, fileMtimeMs: 131, seq: 50 })
+  const rolledBack = fold([[other, [['p|m', bucket('p', 'm', 7)]]]], { fileSize: 300, fileMtimeMs: 132, seq: 5 })
+  check(`${kind}: a shorter fold keeps the day it cannot see`, rolledBack?.days.has(day) === true, [...(rolledBack?.days.keys() ?? [])].join(','))
+  check(`${kind}: ...and the fuller copy is still the one that counts`, rolledBack?.days.get(day)?.get('p|m')?.input === 20000, String(rolledBack?.days.get(day)?.get('p|m')?.input))
+
+  store.close()
+}
+
+// ── 9. rows from another device: stored, never deleted, never downgraded ─────
+//
+// The import path takes rows, not records: a shard is a set of rows, each carrying its own device
+// and its own stamp. Two things must hold, and they are the whole reason this path is separate from
+// the fold path: an import never deletes anything, and it never replaces a fuller copy with a
+// weaker one — not even a copy the same source pushed earlier.
+{
+  const root = makeHome('rows-sync')
+  const dir = storeRoot(root)
+  mkdirSync(dir, { recursive: true })
+  const store = createCacheStore({ dir, log: () => {}, env: {} })
+  const day = dayKeyOf(0)
+  const other = dayKeyOf(-4)
+  const copies = () => store.scan().find((row) => row.sessionId === 's1')?.rows ?? []
+  const merged = () => store.load().find((row) => row.sessionId === 's1')
+  /** One row as a shard carries it. */
+  const incoming = (date, input, stamp, sessionId = 's1') => ({
+    sessionId,
+    date,
+    source: 'device-b',
+    kind: 'current',
+    seq: stamp.seq,
+    fileSize: stamp.fileSize,
+    fileMtimeMs: stamp.fileMtimeMs,
+    at: stamp.at ?? 10,
+    routes: { 'p|m': bucket('p', 'm', input) },
+  })
+
+  // History arrives from another device. The session id matches because it is derived from the log
+  // path, which is exactly why the merge key cannot include the device: two machines that once held
+  // the same log produce the same id, and adding them up would count that usage twice.
+  const written = store.intakeRows([
+    incoming(day, 4000, { seq: 30, fileSize: 5000, fileMtimeMs: 50 }),
+    incoming(other, 1, { seq: 30, fileSize: 5000, fileMtimeMs: 50 }),
+  ])
+  check('rows from another device are stored and readable', written === 2 && merged()?.days.get(day)?.get('p|m')?.input === 4000, `${written} written`)
+  check('...tagged with the device they came from', copies().every((row) => row.source === 'device-b'), JSON.stringify(copies().map((row) => row.source)))
+
+  // The same device pushes a weaker copy of the same day — the classic "this machine's logs were
+  // pruned" case. It must not replace the fuller copy already held.
+  const weaker = store.intakeRows([incoming(day, 7, { seq: 2, fileSize: 100, fileMtimeMs: 1 })])
+  check('a weaker import is dropped, not stored', weaker === 0, `${weaker} written`)
+  check('...so the fuller copy is still the one that counts', merged()?.days.get(day)?.get('p|m')?.input === 4000, String(merged()?.days.get(day)?.get('p|m')?.input))
+
+  // A local fold over a day the *imported* copy covers is stored beside it, under its own source:
+  // the two are not competitors, and the resolver prefers whichever is fuller.
+  const local = store.put(recordOf('s1', [[day, [['p|m', bucket('p', 'm', 11)]]]], { fileSize: 100, fileMtimeMs: 1, seq: 2 }), { at: 1 })
+  check('a local fold does not outrank a fuller imported copy', local?.days.get(day)?.get('p|m')?.input === 4000, String(local?.days.get(day)?.get('p|m')?.input))
+  check('...and the imported row is still stored', copies().some((row) => row.source === 'device-b' && row.date === day), JSON.stringify(copies().map((row) => `${row.date}:${row.source}`)))
+  check('...while the local row keeps its own copy of the day', copies().some((row) => row.source === 'local' && row.date === day), JSON.stringify(copies().map((row) => `${row.date}:${row.source}`)))
+
+  // A local fold stops covering a day the current log no longer has — but that day only exists in
+  // the *imported* rows here. Deleting it would be the original bug: a machine whose log was pruned
+  // erasing the history another machine contributed.
+  store.put(recordOf('s1', [[other, [['p|m', bucket('p', 'm', 9)]]]], { fileSize: 300, fileMtimeMs: 2, seq: 40 }), { at: 2 })
+  check('a local fold leaves the imported day alone', copies().some((row) => row.source === 'device-b' && row.date === day), JSON.stringify(copies().map((row) => `${row.date}:${row.source}`)))
+  check('...while its own rows track the log it can see', copies().some((row) => row.source === 'local' && row.date === other), JSON.stringify(copies().map((row) => `${row.date}:${row.source}`)))
+
+  // Re-importing the same rows is a no-op: a sync that runs twice must not grow the store, and an
+  // equal-stamp copy is the same bytes by definition.
+  const again = store.intakeRows([incoming(day, 4000, { seq: 30, fileSize: 5000, fileMtimeMs: 50 })])
+  check('re-importing identical rows writes nothing', again === 0, `${again} written`)
+  check('...and the store still holds exactly the same rows', copies().length === 3, `${copies().length} row(s)`)
+  store.close()
 }
 
 finish()

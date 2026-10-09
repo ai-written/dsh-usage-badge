@@ -104,6 +104,7 @@ export async function mount(root, scenario) {
   const previous = process.env.DSH_HOME
   process.env.DSH_HOME = root
   let call
+  const pending = []
   try {
     const { apply } = await import(`../lib/index.js?scenario=${scenario}`)
     const routes = []
@@ -117,7 +118,9 @@ export async function mount(root, scenario) {
       effect(body) {
         const dispose = body()
         // Held rather than dropped: the cache store keeps a file handle open, and on Windows a
-        // home with an open handle cannot be deleted — which is what `cleanupHomes` does.
+        // home with an open handle cannot be deleted — which is what `cleanupHomes` does. The
+        // disposers are run by `settle()`, in reverse, because the host half now releases the sync
+        // lock there and that has to happen before a test goes on to claim the same directory.
         if (typeof dispose === 'function') disposers.push(dispose)
         return () => {}
       },
@@ -156,7 +159,31 @@ export async function mount(root, scenario) {
     if (previous === undefined) delete process.env.DSH_HOME
     else process.env.DSH_HOME = previous
   }
-  return { call }
+  /**
+   * Let the host half's asynchronous start-up work finish, and give the caller a way to unload it.
+   *
+   * `apply()` returns before the first fold and before the automatic sync timers are scheduled, so a
+   * test that wants to observe either — or that wants to unload and see the lock handed back — has to
+   * wait for `settle()` first. Disposers run in reverse order, last registered first.
+   */
+  const settle = async () => {
+    // The host half's own effect returns a promise from `warm()`; waiting a turn and then the pending
+    // work is enough for the fold and the timers to exist. Anything asynchronous but unbounded (a sync
+    // against a slow server) is not this helper's business.
+    await new Promise((resolve) => setTimeout(resolve, 0))
+    while (pending.length > 0) await pending.shift()
+  }
+  const dispose = () => {
+    while (disposers.length > 0) {
+      const disposer = disposers.pop()
+      try {
+        disposer()
+      } catch {
+        // A disposer that fails is not the test's subject.
+      }
+    }
+  }
+  return { call, settle, dispose }
 }
 
 /**

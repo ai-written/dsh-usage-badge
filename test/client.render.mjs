@@ -651,6 +651,85 @@ const emptySnapshot = {
 check('usage panel survives an empty snapshot', render({ initialSnapshot: emptySnapshot, initialOpen: true }).includes('暂无用量'))
 check('config panel survives an empty snapshot', render({ initialSnapshot: emptySnapshot, initialOpen: true, initialTab: 'config' }).includes('法定节假日日历'))
 
+// ── the sync tab ─────────────────────────────────────────────────────────────
+const renderSyncPanelMarkup = (initialSync) => render({ initialSnapshot: snapshot, initialOpen: true, initialTab: 'sync', initialSync })
+//
+// Cloud sync is opt-in, and this panel is the only place it is turned on or run. What is asserted
+// here is what a person can see and press: the three tabs exist, the panel explains what it does
+// before anything is configured, the credential field never comes back filled, and the run button is
+// disabled while there is nothing to run with.
+{
+  const dialogMarkup = render({ initialSnapshot: snapshot, initialOpen: true })
+  check(
+    'the dialog has a sync tab beside the other two',
+    dialogMarkup.includes('>用量<') && dialogMarkup.includes('>单价配置<') && dialogMarkup.includes('>同步<'),
+    'one of the three tab labels is missing',
+  )
+
+  // The unconfigured shape is what a first visit looks like: nothing set, the run button not pressable,
+  // and no credential on file. `{ config: {} }` is deliberately the *minimum* the host could answer with
+  // — the panel must survive a payload that predates every field being set.
+  const bareSync = { config: {}, last: { result: 'never', message: '', at: 0 }, remoteDevices: {}, published: {}, conflictFiles: [] }
+  const unconfigured = renderSyncPanelMarkup(bareSync)
+  check('the sync panel explains itself before anything is set up', unconfigured.includes('云同步') && unconfigured.includes('WebDAV 地址'), 'the panel is missing its own explanation')
+  check('...offering the three actions', unconfigured.includes('保存') && unconfigured.includes('测试连接') && unconfigured.includes('立即同步'))
+  check('...with the credential field empty', /type="password"[^>]*value=""/.test(unconfigured), 'the password field came back filled')
+  check('...and the page says a credential is not configured yet', unconfigured.includes('还没有凭据'), 'the credential state is not stated')
+  check('...while the run button is disabled with no credential', /立即同步<\/button>/.test(unconfigured) && unconfigured.includes('disabled=""'), 'the run button is pressable with nothing configured')
+  check('the sync panel survives an empty snapshot', render({ initialSnapshot: emptySnapshot, initialOpen: true, initialTab: 'sync' }).includes('云同步'))
+
+  // The configured state is what a returning user sees: the credential is reported as a prefix, never
+  // as a value, and the run button becomes pressable.
+  const configuredSync = {
+    config: {
+      enabled: true,
+      url: 'http://nas:19347/',
+      username: 'alice',
+      realm: 'WebDAV',
+      deviceId: 'desktop',
+      deviceLabel: 'desk',
+      windowYears: 5,
+      allowInsecureTls: false,
+      hasCredential: true,
+      credentialPrefix: 'abcdef…',
+    },
+    writable: true,
+    lock: null,
+    running: false,
+    last: { result: 'ok', message: 'pulled 2 shard(s) / 12 row(s), pushed 1 shard(s) / 3 KB, 1 month(s) unchanged', at: Date.UTC(2026, 9, 9, 6, 0, 0) },
+    remoteDevices: { laptop: 3 },
+    published: { '2026-09': {}, '2026-10': {} },
+    conflictFiles: [],
+    paths: { sync: 'C:/x/sync.json', pricing: 'C:/x/pricing.json' },
+  }
+  const markup = renderSyncPanelMarkup(configuredSync)
+  check('a configured sync panel shows the last run verbatim', markup.includes('pulled 2 shard(s)') && markup.includes('ok'), 'the last outcome is not shown')
+  check('...shows the remote devices it knows about', markup.includes('laptop（3 个月）'), 'the remote device list is missing')
+  check('...counts the months it has published', markup.includes('已经发布的月份') && markup.includes('>2<'), 'the published count is missing')
+  // The prefix is asserted in two pieces because React escapes no characters here but the ellipsis is
+  // not plain ASCII; what matters is that the value shown is a *prefix*, and that the full HA1 is not.
+  const passwordField = /<input[^>]*type="password"[^>]*>/.exec(markup)?.[0] ?? ''
+  check('...reports a credential as a prefix only', passwordField.includes('已配置') && passwordField.includes('abcdef…'), passwordField)
+  // The full HA1 is long enough that a page printing it would be caught here; the six-character prefix
+  // is the only part the host ever sends back.
+  const fullHa1 = 'abcdef0123456789abcdef0123456789'
+  const withFullCredential = renderSyncPanelMarkup({ ...configuredSync, config: { ...configuredSync.config, credentialPrefix: `${fullHa1.slice(0, 6)}…` } })
+  check('...and never as the credential itself', !withFullCredential.includes(fullHa1), 'the credential leaked into the page')
+  check('...and offers turning it off', markup.includes('点此关闭'), 'the enable switch is missing the off state')
+  check('...with the run button no longer disabled', /<button(?![^>]*disabled)[^>]*>立即同步<\/button>/.test(markup), (markup.match(/<button[^>]*>立即同步<\/button>/) ?? ['(no run button)'])[0])
+
+  const conflicted = renderSyncPanelMarkup({ ...configuredSync, conflictFiles: ['.conflict-pricing-laptop-1.json'] })
+  check('a conflict file is surfaced rather than hidden', conflicted.includes('.conflict-pricing-laptop-1.json'), 'the conflict file is not mentioned')
+  const locked = renderSyncPanelMarkup({ ...configuredSync, writable: false, lock: { reason: 'another instance holds the lock', owner: { pid: 1234 } } })
+  check('a locked data directory is announced', locked.includes('pid 1234') && locked.includes('只读'), 'the lock note is missing')
+  // Two machines using one device name overwrite each other's shards, so the panel has to say so where
+  // the fix is (the device field), with the owner's identity and both ways out.
+  const clashing = renderSyncPanelMarkup({ ...configuredSync, collision: { device: 'company', owner: 'instance-two', at: 1 } })
+  check('a device-name clash is spelled out, not just logged', clashing.includes('已经被另一台机器占用') && clashing.includes('instance-two'), 'the clash is not shown')
+  check('...offering both ways out', clashing.includes('改成一个没用过的名字') && clashing.includes('usage-badge/company/'), 'the remedies are missing')
+  check('...and absent when there is no clash', !renderSyncPanelMarkup(configuredSync).includes('已经被另一台机器占用'))
+}
+
 // A provider row whose hourly series is empty must still render its tab and must
 // not break the shared chart, which is what a sparse provider looks like.
 const first = snapshot.today.providers[0] ?? { provider: 'ghost', amount: 0, requests: 0, input: 0, cacheRead: 0, cacheWrite: 0, output: 0 }

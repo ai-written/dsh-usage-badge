@@ -24,6 +24,7 @@ import { readdirSync, readFileSync } from 'node:fs'
 import { join } from 'node:path'
 
 import {
+  DATA_DIR,
   close,
   createChecker,
   listDataDir,
@@ -422,6 +423,7 @@ const key = (year, month, day) => `${year}-${String(month).padStart(2, '0')}-${S
     multiplier: 1,
     default: rate(2e6),
     overrides: { 'deepseek-nova': rate(4e6) },
+    holidays: { source: 'cn' },
   })
   writeSession(root, 's', { provider: 'p', model: 'deepseek-nova-9', time: now, input: 1000 })
   writeSession(root, 'u', { provider: 'q', model: 'unknown-9', time: now - 1000, input: 1000 })
@@ -433,11 +435,33 @@ const key = (year, month, day) => `${year}-${String(month).padStart(2, '0')}-${S
   check('an unmatched model is priced by the default row unless told otherwise',
     close(amountOf(before.body, 'q'), 2000), `got ${amountOf(before.body, 'q')}`)
 
+  // A switch is one field of a hand-written document. Flipping it must not rewrite the rest — the
+  // overrides, the catch-all row and the holiday switch are the parts a user would have to retype, and
+  // the very same document is now also **published** by the sync, so a field dropped here would be
+  // dropped on the server too. The **file** is compared, not the resolved view: the resolved view fills
+  // in defaults, and a field disappearing there would be invisible in that comparison.
+  const rawTable = () => JSON.parse(readFileSync(join(root, DATA_DIR, 'pricing.json'), 'utf8'))
+  const tableBeforeSwitch = rawTable()
   const off = await call('PUT', '/usage-badge/config', { modelPrefixFallback: false })
   check('the prefix switch goes through the config route',
     off.status === 200 && off.body.effective.modelPrefixFallback === false, `${off.status}`)
   check('the prefix switch is persisted to the price table',
     readPricing(root).modelPrefixFallback === false, JSON.stringify(readPricing(root).modelPrefixFallback))
+  // Written out field by field rather than deep-compared: setting a field that was absent appends it,
+  // so object identity is the wrong question. What matters is that each value the user wrote is still
+  // there with the same content — those are the parts they would have to retype, and the same document
+  // is now **published** by the sync, so a field dropped here would be dropped on the server too.
+  const afterSwitch = rawTable()
+  check(
+    '...and every other field of the table is exactly as it was',
+    afterSwitch.exchangeRate === tableBeforeSwitch.exchangeRate &&
+      afterSwitch.totalCurrency === tableBeforeSwitch.totalCurrency &&
+      afterSwitch.multiplier === tableBeforeSwitch.multiplier &&
+      JSON.stringify(afterSwitch.default) === JSON.stringify(tableBeforeSwitch.default) &&
+      JSON.stringify(afterSwitch.overrides) === JSON.stringify(tableBeforeSwitch.overrides) &&
+      JSON.stringify(afterSwitch.holidays) === JSON.stringify(tableBeforeSwitch.holidays),
+    JSON.stringify({ before: Object.keys(tableBeforeSwitch), after: Object.keys(afterSwitch) }),
+  )
 
   const afterOff = await call('GET', '/usage-badge/summary')
   check('turning the prefix fallback off re-prices in the same process',

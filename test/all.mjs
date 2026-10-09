@@ -22,6 +22,11 @@ const SUITES = [
   './holidays.verify.mjs',
   './official-pricing.verify.mjs',
   './cache.verify.mjs',
+  './sync.verify.mjs',
+  './sync-engine.verify.mjs',
+  './host-sync.verify.mjs',
+  './sync-triggers.verify.mjs',
+  './webdav.verify.mjs',
   './client.render.mjs',
 ]
 

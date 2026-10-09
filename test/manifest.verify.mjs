@@ -15,7 +15,7 @@
  *   node test/manifest.verify.mjs
  */
 
-import { existsSync, readFileSync } from 'node:fs'
+import { existsSync, readFileSync, readdirSync } from 'node:fs'
 import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
@@ -73,7 +73,15 @@ check('the host half exports apply()', /export function apply\b/.test(hostSource
 check('the host half exports inject', /export const inject\b/.test(hostSource))
 // A default export makes the loader fold the module and discard `inject`.
 check('the host half has no default export', !/export default\b/.test(hostSource))
-check('the host half has no default export in its helpers', !/export default\b/.test(read('lib/fold.js')) && !/export default\b/.test(read('lib/pricing.js')))
+// Every host-half module, not a hand-written list: a new file (the WebDAV client, a sync
+// store) must be covered the day it lands, and `lib/client.js` is excluded because it is the
+// browser bundle rather than an ESM module.
+const hostModules = readdirSync(join(root, 'lib'))
+  .filter((name) => name.endsWith('.js'))
+  .filter((name) => /^export\b/m.test(read(join('lib', name))))
+for (const name of hostModules) {
+  check(`lib/${name} has no default export`, !/export default\b/.test(read(join('lib', name))))
+}
 
 // ── packaging ────────────────────────────────────────────────────────────────
 const files = pkg.files ?? []
