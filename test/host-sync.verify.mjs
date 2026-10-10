@@ -84,6 +84,13 @@ try {
     check('...including a path below the root', deeper.body.config.url === 'https://nas.example/dav/', JSON.stringify(deeper.body.config.url))
     const already = await call('POST', '/usage-badge/sync', { url: 'http://nas:19347/dav/' })
     check('...and an address that already ends in one is left alone', already.body.config.url === 'http://nas:19347/dav/', JSON.stringify(already.body.config.url))
+    // The two shapes that used to be accepted and then fail in the field: a missing host (WHATWG reads the
+    // next segment as the host, pointing the sync at another machine) and an encoded slash (a 404 on this
+    // server family, after which the field would have shown a URL nobody meant).
+    const noHost = await call('POST', '/usage-badge/sync', { url: 'http:///dav' })
+    check('...an address with no host is refused with a reason', noHost.status === 400 && /no host/.test(String(noHost.body.error)), JSON.stringify(noHost.body))
+    const encodedSlash = await call('POST', '/usage-badge/sync', { url: 'http://nas:19347/dav%2f' })
+    check('...and one with an encoded slash is refused by name', encodedSlash.status === 400 && /%2f/.test(String(encodedSlash.body.error)), JSON.stringify(encodedSlash.body))
   }
   const badDevice = await call('POST', '/usage-badge/sync', { deviceId: 'a/b' })
   check('a device id with a slash is refused', badDevice.status === 400, JSON.stringify(badDevice.body))

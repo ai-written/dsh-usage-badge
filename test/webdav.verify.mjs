@@ -87,6 +87,15 @@ const { check, finish } = createChecker('webdav (Digest client)')
     JSON.stringify(normalizeWebdavUrl('http://nas/dav', { allowTrailingSlashFix: false })),
   )
   check('...and a plain-http address is reported as such', normalizeWebdavUrl('http://nas/').insecure === true && normalizeWebdavUrl('https://nas/').insecure === false)
+  // `new URL('http:///dav')` does **not** fail: WHATWG drops the empty authority and reads `dav` as the
+  // host, so accepting it would silently point the sync at another machine.
+  const missingHost = normalizeWebdavUrl('http:///dav')
+  check('...a URL with no host is refused rather than retargeted', missingHost.ok === false && /no host/.test(missingHost.reason), JSON.stringify(missingHost))
+  check('...likewise a scheme with an empty authority', normalizeWebdavUrl('http:nas').ok === false, JSON.stringify(normalizeWebdavUrl('http:nas')))
+  // An encoded slash is not a slash to Apache, and appending a real one after it makes a path nobody meant.
+  const encodedSlash = normalizeWebdavUrl('http://nas/dav%2f')
+  check('...and an encoded slash in the path is refused by name', encodedSlash.ok === false && /%2f/.test(encodedSlash.reason), JSON.stringify(encodedSlash))
+  check('...while a percent-encoded space is left alone, because it is a real character in a name', normalizeWebdavUrl('http://nas/my%20dir').url === 'http://nas/my%20dir/', JSON.stringify(normalizeWebdavUrl('http://nas/my%20dir')))
 }
 
 const md5 = (value) => createHash('md5').update(value).digest('hex')

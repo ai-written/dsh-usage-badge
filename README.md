@@ -95,7 +95,7 @@ dsh plugin --profile web remove dsh-usage-badge
 
 ```sh
 npm install   # 只为测试装 react / react-dom
-npm test      # 11 个套件 839 条断言：包契约、定价、节假日、官方定价解析、缓存存储、同步分片、同步编排、宿主同步接线、自动触发、WebDAV(Digest)、浏览器半渲染
+npm test      # 11 个套件 845 条断言：包契约、定价、节假日、官方定价解析、缓存存储、同步分片、同步编排、宿主同步接线、自动触发、WebDAV(Digest)、浏览器半渲染
 ```
 
 云同步的前五步已经在真实的 `bytemark/webdav` 容器上核对通过。要自己核对一遍：
