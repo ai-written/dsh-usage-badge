@@ -730,6 +730,49 @@ const renderSyncPanelMarkup = (initialSync) => render({ initialSnapshot: snapsho
   check('...and absent when there is no clash', !renderSyncPanelMarkup(configuredSync).includes('已经被另一台机器占用'))
 }
 
+// ── the sync form is filled from the saved configuration ─────────────────────
+//
+// The tab used to come up empty after a restart: the fields were seeded once, from the value passed in —
+// and on a fresh page load that value is `null`, because `/sync` has not been read yet — so the response
+// updated the status *below* the form and never the form itself. The configuration was always there; it
+// simply was not shown, which reads as "my settings are gone".
+//
+// The rule is tested directly because the browser half cannot be mounted here (`react-dom/test-utils` sits
+// behind a package export in this environment), so the part that matters is a pure function the bundle
+// exports for exactly this purpose.
+{
+  const { fillSyncForm } = plugin
+  check('the bundle exposes the fill rule for testing', typeof fillSyncForm === 'function')
+
+  const saved = {
+    config: { url: 'http://nas:19347/', username: 'alice', realm: 'WebDAV', deviceId: 'desk', windowYears: 3, allowInsecureTls: true },
+  }
+  const empty = {}
+  const filled = fillSyncForm(saved, empty)
+  check('an empty form is filled from the saved configuration', filled.url === 'http://nas:19347/' && filled.username === 'alice', JSON.stringify(filled))
+  check('...including the device name, realm and window', filled.deviceId === 'desk' && filled.realm === 'WebDAV' && filled.windowYears === '3', JSON.stringify(filled))
+  check('...and the checkbox, which has no empty state', filled.allowInsecureTls === true)
+  check('...without mutating what it was given', Object.keys(empty).length === 0)
+
+  const typed = fillSyncForm(saved, { url: 'http://other/', username: 'bob', realm: 'REALM2', deviceId: 'mine', windowYears: '9' })
+  // The checkbox is the exception: it has no "empty" to protect, so it is proposed on every call. The
+  // component only applies the whole patch once per saved configuration (`filledFrom`), which is what stops
+  // a box the person unticked from being ticked again behind their back.
+  check('text the person has typed in is never overwritten', typed.url === undefined && typed.username === undefined && typed.deviceId === undefined && typed.windowYears === undefined && typed.realm === undefined, JSON.stringify(typed))
+  const partial = fillSyncForm(saved, { url: 'http://other/', username: 'bob' })
+  check('...while the fields still empty are filled', partial.deviceId === 'desk' && partial.realm === 'WebDAV' && partial.windowYears === '3' && partial.url === undefined, JSON.stringify(partial))
+
+  check(
+    'nothing saved means nothing filled',
+    Object.keys(fillSyncForm({ config: {} }, {})).length === 0 && Object.keys(fillSyncForm(null, {})).length === 0 && Object.keys(fillSyncForm({}, {})).length === 0,
+  )
+  // A window of 0 means "fetch everything", and 0 is falsy — dropping it would quietly turn "everything"
+  // back into the default five years the moment the page reloaded.
+  const zero = fillSyncForm({ config: { windowYears: 0 } }, {})
+  check('a zero window is carried through, not treated as unset', zero.windowYears === '0', JSON.stringify(zero))
+  check('an unset window is left to the field’s own default', fillSyncForm({ config: {} }, {}).windowYears === undefined)
+}
+
 // A provider row whose hourly series is empty must still render its tab and must
 // not break the shared chart, which is what a sparse provider looks like.
 const first = snapshot.today.providers[0] ?? { provider: 'ghost', amount: 0, requests: 0, input: 0, cacheRead: 0, cacheWrite: 0, output: 0 }

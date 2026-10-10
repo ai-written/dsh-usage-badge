@@ -71,6 +71,20 @@ try {
 
   const badUrl = await call('POST', '/usage-badge/sync', { url: 'not a url' })
   check('a URL that is not a URL is refused with a reason', badUrl.status === 400 && /not a URL/.test(String(badUrl.body.error)), JSON.stringify(badUrl.body))
+  // A collection needs its trailing slash. The browser half **refuses** to build a client without one (a
+  // WebDAV server answers a slash-less directory with a 301, and chasing it turns a mistyped address into
+  // what looks like a wrong password), so the save route must not accept what the client refuses — a panel
+  // storing a URL it can never use reports a lie in its own address field.
+  {
+    const stored = () => JSON.parse(readFileSync(join(dataDir, 'sync.json'), 'utf8')).url
+    const noSlash = await call('POST', '/usage-badge/sync', { url: 'http://nas:19347' })
+    check('a URL without its trailing slash is normalised, not stored as typed', noSlash.status === 200 && noSlash.body.config.url === 'http://nas:19347/', JSON.stringify(noSlash.body.config.url))
+    check('...and the file agrees', stored() === 'http://nas:19347/', stored())
+    const deeper = await call('POST', '/usage-badge/sync', { url: 'https://nas.example/dav' })
+    check('...including a path below the root', deeper.body.config.url === 'https://nas.example/dav/', JSON.stringify(deeper.body.config.url))
+    const already = await call('POST', '/usage-badge/sync', { url: 'http://nas:19347/dav/' })
+    check('...and an address that already ends in one is left alone', already.body.config.url === 'http://nas:19347/dav/', JSON.stringify(already.body.config.url))
+  }
   const badDevice = await call('POST', '/usage-badge/sync', { deviceId: 'a/b' })
   check('a device id with a slash is refused', badDevice.status === 400, JSON.stringify(badDevice.body))
 
