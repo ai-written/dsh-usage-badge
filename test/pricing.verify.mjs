@@ -699,4 +699,4 @@ const key = (year, month, day) => `${year}-${String(month).padStart(2, '0')}-${S
     JSON.stringify(restored.body.defaultRow))
 }
 
-finish()
+await finish()

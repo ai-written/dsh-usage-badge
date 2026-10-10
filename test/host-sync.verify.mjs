@@ -21,6 +21,11 @@ import { createChecker, makeHome, mount, DATA_DIR } from './helpers.mjs'
 
 const { check, finish } = createChecker('HOST SYNC VERIFY')
 
+// No exit sync here: most fixtures in this suite have sync switched on, and the point of each one is a
+// route or a lock, not the shutdown path. `test/sync-triggers.verify.mjs` is where the exit sync is tested,
+// with its own budget. (A zero budget is the documented "there is no time for this" switch.)
+process.env.DSH_USAGE_BADGE_EXIT_SYNC_MS = '0'
+
 const home = makeHome('host-sync')
 const dataDir = join(home, DATA_DIR)
 const server = await startFakeWebDav()
@@ -303,7 +308,7 @@ try {
     await unloadCall('GET', '/usage-badge/sync')
     check('a live host holds the lock', existsSync(join(unloadDir, 'host.lock')) && readLock(unloadDir)?.pid === process.pid, JSON.stringify(readLock(unloadDir)))
     await settle()
-    dispose()
+    await dispose()
     check('unloading releases it', !existsSync(join(unloadDir, 'host.lock')), JSON.stringify(readLock(unloadDir)))
 
     const { call: second } = await mount(unloadHome, 'host-sync-unload-2')
@@ -342,4 +347,4 @@ try {
   }
 }
 
-finish()
+await finish()

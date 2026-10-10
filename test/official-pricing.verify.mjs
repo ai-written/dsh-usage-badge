@@ -303,4 +303,4 @@ const en = parseOfficialPricing(fixture('en'), { url: 'https://api-docs.deepseek
   }
 }
 
-finish()
+await finish()

@@ -762,10 +762,17 @@ const renderSyncPanelMarkup = (initialSync) => render({ initialSnapshot: snapsho
   const partial = fillSyncForm(saved, { url: 'http://other/', username: 'bob' })
   check('...while the fields still empty are filled', partial.deviceId === 'desk' && partial.realm === 'WebDAV' && partial.windowYears === '3' && partial.url === undefined, JSON.stringify(partial))
 
+  const textFields = (patch) => Object.keys(patch).filter((key) => !['onStart', 'onExit'].includes(key))
   check(
-    'nothing saved means nothing filled',
-    Object.keys(fillSyncForm({ config: {} }, {})).length === 0 && Object.keys(fillSyncForm(null, {})).length === 0 && Object.keys(fillSyncForm({}, {})).length === 0,
+    'nothing saved means no text field is filled',
+    textFields(fillSyncForm({ config: {} }, {})).length === 0 && textFields(fillSyncForm(null, {})).length === 0 && textFields(fillSyncForm({}, {})).length === 0,
   )
+  // The two automatic triggers default to **on**, so a configuration that predates the fields reads as on
+  // rather than silently switching them off — while an explicit `false` stays off.
+  const switches = fillSyncForm({ config: {} }, {})
+  check('...while the automatic triggers default to on', switches.onStart === true && switches.onExit === true, JSON.stringify(switches))
+  const bothOff = fillSyncForm({ config: { onStart: false, onExit: false } }, {})
+  check('...and a saved off stays off', bothOff.onStart === undefined && bothOff.onExit === undefined, JSON.stringify(bothOff))
   // A window of 0 means "fetch everything", and 0 is falsy — dropping it would quietly turn "everything"
   // back into the default five years the moment the page reloaded.
   const zero = fillSyncForm({ config: { windowYears: 0 } }, {})
@@ -1191,7 +1198,7 @@ check('there is no 调休 shading', !/dub-band-makeup/.test(clientSource))
 }
 
 // ── 11. verdict ──────────────────────────────────────────────────────────────
-cleanupHomes()
+await cleanupHomes()
 const failed = checks.filter((c) => !c.ok)
 console.log(`\n${checks.length - failed.length}/${checks.length} checks passed`)
 if (failed.length > 0) {

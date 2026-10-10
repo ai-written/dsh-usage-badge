@@ -179,4 +179,4 @@ async function dayFor(scenario, dateKey, moment, holidays) {
   check('the two days carry different classes', byDate.get('2026-10-02').dayClass === 'holiday' && byDate.get('2026-10-09').dayClass === 'normal')
 }
 
-finish()
+await finish()

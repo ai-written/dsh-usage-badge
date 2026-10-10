@@ -369,4 +369,4 @@ try {
   check('a root base keeps none', WebDavClient.target(root.url('usage-badge/x.json')) === '/usage-badge/x.json', WebDavClient.target(root.url('usage-badge/x.json')))
 }
 
-finish()
+await finish()

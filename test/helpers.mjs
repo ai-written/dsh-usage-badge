@@ -30,10 +30,13 @@ export function makeHome(prefix) {
  * The order matters on Windows: a mounted plugin holds its cache file open, and an open handle
  * makes the directory undeletable.
  */
-export function cleanupHomes() {
+export async function cleanupHomes() {
   for (const dispose of disposers.splice(0)) {
     try {
-      dispose()
+      // Awaited: the disposer is async (it syncs once on the way out), and a home cannot be removed while
+      // its cache file is still open.
+      // eslint-disable-next-line no-await-in-loop -- one disposer at a time, oldest home first
+      await dispose()
     } catch {
       // A failing disposer must not stop the cleanup.
     }
@@ -175,11 +178,20 @@ export async function mount(root, scenario) {
     await new Promise((resolve) => setTimeout(resolve, 0))
     while (pending.length > 0) await pending.shift()
   }
-  const dispose = () => {
+  /**
+   * Unload the host half, **awaiting** its disposers.
+   *
+   * The plugin's disposer is async: it syncs once on the way out before handing the lock back and closing
+   * the store, and DSH's own shutdown awaits whatever a disposer returns (with a 5 s ceiling). A test that
+   * called it and carried straight on would see the lock still in place and the store still open — a state
+   * that never exists in a real shutdown.
+   */
+  const dispose = async () => {
     while (disposers.length > 0) {
       const disposer = disposers.pop()
       try {
-        disposer()
+        // eslint-disable-next-line no-await-in-loop -- disposers run in order, one after another
+        await disposer()
       } catch {
         // A disposer that fails is not the test's subject.
       }
@@ -215,8 +227,15 @@ export function createChecker(title) {
       failures.push(label)
     }
   }
-  const finish = () => {
-    cleanupHomes()
+  /**
+   * Print the verdict, after unloading every mount.
+   *
+   * Async because disposal now is: the plugin's disposer syncs once on the way out, and DSH itself awaits
+   * it. A suite ends with `await finish()`, so a home can never be removed while its cleanup is still
+   * running — or its cache file still open.
+   */
+  const finish = async () => {
+    await cleanupHomes()
     if (failures.length > 0) {
       console.error(`\n${title}: ${failures.length} check(s) failed`)
       process.exit(1)

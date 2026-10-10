@@ -412,11 +412,15 @@ npm test
 - **`HOST_API_VERSION` 6 → 7**，`REQUIRED_HOST_API` 同步跟上（`client.render.mjs` 有一条断言钉住两半相等）。
 - 插件**挂载时不创建任何东西**：`sync.json`、`host.lock` 都是第一次碰「同步」时才出现（拿锁 = 这个进程可以写）。这条有断言钉着，否则每个从不用同步的安装也会多出两个文件。
 
-**自动触发**（`lib/index.js`）：
+**自动触发**（`lib/index.js`）：一共三条，都可以在面板里开关（前两条）或由配置控制。
 
-- **启动后延迟一次**（`STARTUP_SYNC_DELAY_MS`，默认 8 秒）：只在**同步已经配置且开启**时才排期，所以从没开过同步的 home 不会因此多出 `sync.json`、锁或网络请求；延迟是为了让冷折叠与首屏先走完 —— 一上来就同步会和「让徽标先显示东西」抢时间；锁不在本实例手上时**跳过并说明**，而不是把锁从别人手里抢过来。
+- **启动后延迟一次**（`STARTUP_SYNC_DELAY_MS`，默认 8 秒，开关 `onStart`）：只在**同步已经配置且开启**时才排期，所以从没开过同步的 home 不会因此多出 `sync.json`、锁或网络请求；延迟是为了让冷折叠与首屏先走完 —— 一上来就同步会和「让徽标先显示东西」抢时间；锁不在本实例手上时**跳过并说明**，而不是把锁从别人手里抢过来。
+- **退出前同步一次**（`EXIT_SYNC_BUDGET_MS`，默认 3.5 秒，开关 `onExit`）：这是**真的被 await 的**，不是「发了就希望它跑完」。依据是查清了 DSH 的关闭链条（见下）：桌面端给宿主子进程发 `{type:'shutdown'}`，宿主 `await application.shutdown.shutdown(0)`，而 `createProcessShutdown` 是 `Promise.resolve().then(dispose).then(...)`，cordis 的 `dispose()` 又会收集各 effect disposer 的返回值、是 thenable 就 `task = result` 串下去 —— 所以**本插件的 disposer 返回一个 promise 就会被等到**（上限 `PROCESS_SHUTDOWN_TIMEOUT_MS = 5000`，之后 `process.exit`；桌面端另外最多等 10 秒子进程退出）。
+  - 顺序因此必须是：**先同步**（此时 store 还开着、锁还在手上）→ 再交还锁 → 最后 `aggregator.close()`。
+  - 预算到了就 `engine.abort()`：运行在**下一个阶段边界**停下，不会留下半张清单（上传走临时名 + 最后写清单）。预算为 0 表示「没时间做这件事」，测试与调试用它关掉这条。
+  - 配置从**磁盘**读：这一轮会话可能从没碰过同步（上次配好、这次没打开面板就关掉），那种情况下退出同步要自己把 system 建起来 —— 否则「配好了但没打开面板」就等于永远不同步。
 - **价格表变更后推一次**（`PRICING_PUSH_DELAY_MS`，默认 3 秒，去抖）：改完一行再改下一行是**一个**意图，所以等一小会儿；推的是 `pushPricing()` —— **只动价格表，不跑整轮**（价格编辑与分片无关，整轮会把整个远端清单拖进来）。它是 fire-and-forget：**连不上服务器绝不能让本地编辑失败**，留下的状态由面板报告。
-- 两个延迟都可以用环境变量覆盖（`DSH_USAGE_BADGE_STARTUP_SYNC_MS` / `DSH_USAGE_BADGE_PRICING_PUSH_MS`），这是 `test/sync-triggers.verify.mjs` 不必真等几秒的办法。**启动延迟在 `apply()` 里同步读取**，不在 warm 的回调里读 —— warm 是异步的，等它跑完再读，拿到的会是「那之后」的值（测试设的覆盖值那时已经被撤掉，于是它又变回 8 秒，测试只能干等）。
+- 三个时间都可以用环境变量覆盖（`DSH_USAGE_BADGE_STARTUP_SYNC_MS` / `DSH_USAGE_BADGE_EXIT_SYNC_MS` / `DSH_USAGE_BADGE_PRICING_PUSH_MS`），这是 `test/sync-triggers.verify.mjs` 不必真等几秒的办法。**启动延迟在 `apply()` 里同步读取**，不在 warm 的回调里读 —— warm 是异步的，等它跑完再读，拿到的会是「那之后」的值（测试设的覆盖值那时已经被撤掉，于是它又变回 8 秒，测试只能干等）。
 - 卸载时两个待触发的定时器都会被清掉，**锁也会交还**：宿主正在退出还去推一次，会为一个已经不存在的进程写状态；而留着锁会让下一次挂载（热重载、或同一进程里再挂一次）被自己的锁拒绝。
 
 ### 第六轮：一轮对抗性审查找到并修掉的问题

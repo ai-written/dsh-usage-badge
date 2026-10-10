@@ -22,7 +22,7 @@ import { createHash } from 'node:crypto'
 import { join } from 'node:path'
 
 import { startFakeWebDav } from './webdav-server.mjs'
-import { createChecker, makeHome, mount, DATA_DIR } from './helpers.mjs'
+import { createChecker, makeHome, mount, writeSession, DATA_DIR } from './helpers.mjs'
 
 const { check, finish } = createChecker('SYNC TRIGGERS VERIFY')
 
@@ -185,7 +185,7 @@ const writeSync = (home, config) => {
   })
   process.env.DSH_USAGE_BADGE_STARTUP_SYNC_MS = '60'
   const { dispose } = await mount(strayHome, 'trigger-stray-1')
-  dispose() // immediately: the fold has not finished yet
+  await dispose() // immediately: the fold has not finished yet
   delete process.env.DSH_USAGE_BADGE_STARTUP_SYNC_MS
   await new Promise((resolve) => setTimeout(resolve, 400))
   const files = readdirSync(join(strayHome, DATA_DIR))
@@ -209,19 +209,158 @@ const writeSync = (home, config) => {
     state: {},
   })
   process.env.DSH_USAGE_BADGE_STARTUP_SYNC_MS = '600000'
+  // A budget far shorter than the server's answer time: the run in flight is cut off at its next step
+  // boundary, which is exactly what this case is about.
+  process.env.DSH_USAGE_BADGE_EXIT_SYNC_MS = '50'
   try {
     const { call, dispose } = await mount(home, 'trigger-inflight-1')
     const running = call('POST', '/usage-badge/sync/run') // deliberately not awaited: it is in flight
     await until(() => server.state.requests.length > 0, { timeoutMs: 3000 })
-    dispose()
+    await dispose()
     check('unloading during a run releases the lock', !existsSync(join(home, DATA_DIR, 'host.lock')), 'the lock was left behind')
     const outcome = await running.catch((error) => ({ body: { error: String(error?.message ?? error) } }))
     check('...and the run stops at its next step boundary', outcome.body?.result === 'aborted', JSON.stringify(outcome.body?.result ?? outcome.body?.error))
     check('...writing nothing to the server', !server.state.files.has('/usage-badge/inflight/index.json'), [...server.state.files.keys()].join(','))
   } finally {
     delete process.env.DSH_USAGE_BADGE_STARTUP_SYNC_MS
+    delete process.env.DSH_USAGE_BADGE_EXIT_SYNC_MS
     await server.close()
   }
 }
 
-finish()
+// ── 6. a sync on the way out, awaited but bounded ───────────────────────────
+//
+// DSH's shutdown awaits what a disposer returns — the desktop asks the host to stop, the host awaits its own
+// disposal, and the runtime force-exits only after 5 s. So the disposer can sync once for real, as long as it
+// gives up in time. This is the part that has to be true for "it syncs when I close DSH" to be a feature
+// rather than a hope.
+{
+  const server = await startFakeWebDav()
+  const home = makeHome('trigger-exit')
+  // A session to fold and publish, so the run has something to send.
+  writeSession(home, 'exit-1', { provider: 'p', model: 'm', time: Date.now(), input: 4242 })
+  writeSync(home, {
+    enabled: true,
+    url: server.url,
+    username: 'alice',
+    ha1,
+    realm: 'WebDAV',
+    deviceId: 'exit-device',
+    instanceId: 'trigger-exit',
+    windowYears: 5,
+    onStart: false, // only the exit path is under test here
+    state: {},
+  })
+  process.env.DSH_USAGE_BADGE_STARTUP_SYNC_MS = '600000'
+  process.env.DSH_USAGE_BADGE_EXIT_SYNC_MS = '4000'
+  try {
+    const { dispose } = await mount(home, 'trigger-exit-1')
+    check('nothing reaches the server before the host unloads', server.state.requests.length === 0, String(server.state.requests.length))
+    await dispose()
+    check('unloading syncs once before handing the lock back', server.state.files.has('/usage-badge/exit-device/index.json'), [...server.state.files.keys()].join(','))
+    const manifest = JSON.parse(server.state.files.get('/usage-badge/exit-device/index.json').toString('utf8'))
+    check('...publishing the month that was folded', Object.keys(manifest.chunks).length === 1, JSON.stringify(Object.keys(manifest.chunks)))
+    check('...and the lock is still handed back', !existsSync(join(home, DATA_DIR, 'host.lock')), 'the lock was left behind')
+  } finally {
+    delete process.env.DSH_USAGE_BADGE_STARTUP_SYNC_MS
+    delete process.env.DSH_USAGE_BADGE_EXIT_SYNC_MS
+    await server.close()
+  }
+}
+
+// The switch: `onExit: false` means no sync when the host unloads.
+{
+  const server = await startFakeWebDav()
+  const home = makeHome('trigger-exit-off')
+  writeSync(home, {
+    enabled: true,
+    url: server.url,
+    username: 'alice',
+    ha1,
+    realm: 'WebDAV',
+    deviceId: 'exit-off',
+    instanceId: 'trigger-exit-off',
+    windowYears: 5,
+    onStart: false,
+    onExit: false,
+    state: {},
+  })
+  process.env.DSH_USAGE_BADGE_STARTUP_SYNC_MS = '600000'
+  process.env.DSH_USAGE_BADGE_EXIT_SYNC_MS = '4000'
+  try {
+    const { dispose } = await mount(home, 'trigger-exit-off-1')
+    await dispose()
+    check('with the exit sync switched off nothing is sent', server.state.requests.length === 0 && !server.state.files.has('/usage-badge/exit-off/index.json'), `${server.state.requests.length} request(s)`)
+  } finally {
+    delete process.env.DSH_USAGE_BADGE_STARTUP_SYNC_MS
+    delete process.env.DSH_USAGE_BADGE_EXIT_SYNC_MS
+    await server.close()
+  }
+}
+
+// The budget: a server that does not answer must not hold up quitting, and the run must stop at a step
+// boundary rather than leaving a half-written month behind.
+{
+  const server = await startFakeWebDav({ delayMs: 600 })
+  const home = makeHome('trigger-exit-slow')
+  writeSession(home, 'exit-slow-1', { provider: 'p', model: 'm', time: Date.now(), input: 100 })
+  writeSync(home, {
+    enabled: true,
+    url: server.url,
+    username: 'alice',
+    ha1,
+    realm: 'WebDAV',
+    deviceId: 'exit-slow',
+    instanceId: 'trigger-exit-slow',
+    windowYears: 5,
+    onStart: false,
+    state: {},
+  })
+  process.env.DSH_USAGE_BADGE_STARTUP_SYNC_MS = '600000'
+  process.env.DSH_USAGE_BADGE_EXIT_SYNC_MS = '150'
+  try {
+    const { dispose } = await mount(home, 'trigger-exit-slow-1')
+    const started = Date.now()
+    await dispose()
+    const took = Date.now() - started
+    check('a slow server does not hold up the shutdown', took < 2000, `${took} ms`)
+    check('...nothing is left half-published', !server.state.files.has('/usage-badge/exit-slow/index.json'), [...server.state.files.keys()].join(','))
+    check('...no temporary upload name is left behind', [...server.state.files.keys()].every((path) => !path.includes('.upload-')), [...server.state.files.keys()].join(','))
+    check('...and the lock is handed back anyway', !existsSync(join(home, DATA_DIR, 'host.lock')), 'the lock was left behind')
+  } finally {
+    delete process.env.DSH_USAGE_BADGE_STARTUP_SYNC_MS
+    delete process.env.DSH_USAGE_BADGE_EXIT_SYNC_MS
+    await server.close()
+  }
+}
+
+// The other switch: `onStart: false` means no sync on the way up.
+{
+  const server = await startFakeWebDav()
+  const home = makeHome('trigger-start-off')
+  writeSync(home, {
+    enabled: true,
+    url: server.url,
+    username: 'alice',
+    ha1,
+    realm: 'WebDAV',
+    deviceId: 'start-off',
+    instanceId: 'trigger-start-off',
+    windowYears: 5,
+    onStart: false,
+    onExit: false,
+    state: {},
+  })
+  process.env.DSH_USAGE_BADGE_STARTUP_SYNC_MS = '20'
+  try {
+    const { settle } = await mount(home, 'trigger-start-off-1')
+    await settle()
+    await new Promise((resolve) => setTimeout(resolve, 200))
+    check('with the startup sync switched off nothing is sent', server.state.requests.length === 0, `${server.state.requests.length} request(s)`)
+  } finally {
+    delete process.env.DSH_USAGE_BADGE_STARTUP_SYNC_MS
+    await server.close()
+  }
+}
+
+await finish()

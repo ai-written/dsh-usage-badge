@@ -276,4 +276,4 @@ const openStore = (root, env = {}) => {
   check('...and a server with no table takes ours', first.action === 'push', JSON.stringify(first))
 }
 
-finish()
+await finish()

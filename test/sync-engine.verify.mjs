@@ -656,4 +656,4 @@ function recorded(hash) {
   return `${String(hash).slice(0, 8)}…`
 }
 
-finish()
+await finish()

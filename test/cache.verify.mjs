@@ -737,4 +737,4 @@ for (const kind of ['sqlite', 'json']) {
   store.close()
 }
 
-finish()
+await finish()
