@@ -215,7 +215,9 @@ const writeSync = (home, config) => {
     await until(() => server.state.requests.length > 0, { timeoutMs: 3000 })
     dispose()
     check('unloading during a run releases the lock', !existsSync(join(home, DATA_DIR, 'host.lock')), 'the lock was left behind')
-    await running.catch(() => {})
+    const outcome = await running.catch((error) => ({ body: { error: String(error?.message ?? error) } }))
+    check('...and the run stops at its next step boundary', outcome.body?.result === 'aborted', JSON.stringify(outcome.body?.result ?? outcome.body?.error))
+    check('...writing nothing to the server', !server.state.files.has('/usage-badge/inflight/index.json'), [...server.state.files.keys()].join(','))
   } finally {
     delete process.env.DSH_USAGE_BADGE_STARTUP_SYNC_MS
     await server.close()

@@ -381,6 +381,174 @@ try {
     quietStore.close()
   }
 
+  // ── 11. a withdrawal reaches the machines that already imported it ─────────
+  //
+  // The reading half of a tombstone. A publisher drops a day (or a whole month) and republishes; without
+  // this, every reader keeps the rows it imported — an import only ever adds — and the two machines
+  // disagree for good, in the direction of "everyone else counts more than the machine that has the data".
+  // Measured before the fix: publisher 2222, reader 5555.
+  {
+    const tombServer = await startFakeWebDav()
+    const tombClient = () => new WebDavClient({ baseUrl: tombServer.url, username: 'alice', passwordHash: credential.ha1 })
+    const homeA = makeHome('engine-tomb-a')
+    const homeB = makeHome('engine-tomb-b')
+    const storeA = openStore(homeA)
+    const storeB = openStore(homeB)
+    storeA.put(recordOf('w-1', [['2026-04-10', [['p|m', bucket('p', 'm', 1111)]]]]), { at: 30 })
+    storeA.put(recordOf('w-2', [['2026-04-11', [['p|m', bucket('p', 'm', 2222)]]]]), { at: 30 })
+    const publisher = new SyncEngine({ dataDir: storeRoot(homeA), store: storeA, client: tombClient(), now: () => 20_000, instanceId: 'inst-tomb-a' })
+    publisher.save({ config: { ...credential, url: tombServer.url, deviceId: 'alpha' } })
+    await runAndRelease(publisher)
+
+    const reader = new SyncEngine({ dataDir: storeRoot(homeB), store: storeB, client: tombClient(), now: () => 20_100, instanceId: 'inst-tomb-b' })
+    reader.save({ config: { ...credential, url: tombServer.url, deviceId: 'beta' } })
+    await runAndRelease(reader)
+    check('the reader imports the month first', totalInput(storeB) === 3333, String(totalInput(storeB)))
+
+    // One of the two days goes away, and the month stays (the other session still has a day in it).
+    storeA.put(recordOf('w-1', [['2026-04-10', [['p|m', bucket('p', 'm', 1111)]]]]), { at: 30 })
+    storeA.put(recordOf('w-2', [['2026-05-01', [['p|m', bucket('p', 'm', 2222)]]]]), { at: 30 })
+    const corrected = await runAndRelease(publisher)
+    check('...the publisher republishes the month', corrected.result === 'ok' && corrected.pushed >= 1, JSON.stringify({ result: corrected.result, pushed: corrected.pushed }))
+    const readerAgain = await runAndRelease(reader)
+    check('...and what the reader no longer sees is dropped from the reader too', totalInput(storeB) === totalInput(storeA), `${totalInput(storeB)} vs the publisher's ${totalInput(storeA)}`)
+    // The month kept its key, so the shard itself is the statement: a reader that applies the new version
+    // drops the row the publisher no longer lists, without needing a tombstone or a failure to report.
+    check('...by replacing that month rather than by asking again', readerAgain.result === 'ok' && readerAgain.dropped === 0, JSON.stringify({ dropped: readerAgain.dropped, result: readerAgain.result }))
+
+    // Now the whole month goes: both sessions lose their April day, so April disappears entirely.
+    storeA.put(recordOf('w-1', [['2026-05-01', [['p|m', bucket('p', 'm', 1111)]]]]), { at: 30 })
+    storeA.put(recordOf('w-2', [['2026-06-01', [['p|m', bucket('p', 'm', 2222)]]]]), { at: 30 })
+    const retired = await runAndRelease(publisher)
+    const manifest = JSON.parse(tombServer.state.files.get('/usage-badge/alpha/index.json').toString('utf8'))
+    check('...withdrawing a month leaves a tombstone', retired.withdrawn >= 1 && Boolean(manifest.retired?.['2026-04']), JSON.stringify({ withdrawn: retired.withdrawn, retired: Object.keys(manifest.retired ?? {}) }))
+    check('...and the shard is gone from the server', !tombServer.state.files.has('/usage-badge/alpha/2026-04.ndjson.zst'), [...tombServer.state.files.keys()].join(','))
+
+    const readerThird = await runAndRelease(reader)
+    check('...so the reader drops that month as well', readerThird.dropped >= 1 && totalInput(storeB) === totalInput(storeA), JSON.stringify({ dropped: readerThird.dropped, reader: totalInput(storeB), publisher: totalInput(storeA) }))
+    // The tombstone is not cleared by a later run, or a reader syncing tomorrow would re-import the month.
+    const readerFourth = await runAndRelease(reader)
+    check('...and the two machines agree from then on', totalInput(storeB) === totalInput(storeA) && readerFourth.dropped === 0, JSON.stringify({ reader: totalInput(storeB), publisher: totalInput(storeA), dropped: readerFourth.dropped }))
+    storeA.close()
+    storeB.close()
+    await tombServer.close()
+  }
+
+  // ── 12. a shard written earlier than the one already applied ───────────────
+  //
+  // A restored backup or an older manifest hands a reader a shard it already went past. Applying it would
+  // delete rows the reader has and the publisher no longer knows about, so the version stamp decides: an
+  // older shard is kept out, not merged.
+  {
+    const rollServer = await startFakeWebDav()
+    const rollClient = () => new WebDavClient({ baseUrl: rollServer.url, username: 'alice', passwordHash: credential.ha1 })
+    const writerHome = makeHome('engine-roll-writer')
+    const writerStore = openStore(writerHome)
+    // A clock that moves: the version guard compares *when* a shard was written, so two shards written at
+    // the same instant could not be told apart.
+    let writerNow = 30_000
+    const writer = new SyncEngine({ dataDir: storeRoot(writerHome), store: writerStore, client: rollClient(), now: () => writerNow++, instanceId: 'inst-roll-a' })
+    writer.save({ config: { ...credential, url: rollServer.url, deviceId: 'gamma' } })
+    writerStore.put(recordOf('z-1', [['2026-07-01', [['p|m', bucket('p', 'm', 100)]]]]), { at: 30 })
+    await runAndRelease(writer)
+    const firstManifest = JSON.parse(rollServer.state.files.get('/usage-badge/gamma/index.json').toString('utf8'))
+    const firstBytes = rollServer.state.files.get('/usage-badge/gamma/2026-07.ndjson.zst')
+
+    const rollHome = makeHome('engine-roll-reader')
+    const rollStore = openStore(rollHome)
+    const reader = new SyncEngine({ dataDir: storeRoot(rollHome), store: rollStore, client: rollClient(), now: () => 30_100, instanceId: 'inst-roll-b' })
+    reader.save({ config: { ...credential, url: rollServer.url, deviceId: 'delta' } })
+    await runAndRelease(reader)
+    check('the reader applies the first version', totalInput(rollStore) === 100, String(totalInput(rollStore)))
+
+    // A newer version, which the reader takes.
+    writerStore.put(recordOf('z-1', [['2026-07-01', [['p|m', bucket('p', 'm', 400)]]]]), { at: 30 })
+    await runAndRelease(writer)
+    await runAndRelease(reader)
+    check('...and then a newer one', totalInput(rollStore) === 400, String(totalInput(rollStore)))
+
+    // The publisher's state is rolled back — a restored backup, an older sync: **both** the manifest and the
+    // shard bytes go back to the first version, so the hash check passes and only the version stamp is left
+    // to notice that this is not news.
+    rollServer.state.files.set('/usage-badge/gamma/2026-07.ndjson.zst', firstBytes)
+    rollServer.state.files.set('/usage-badge/gamma/index.json', Buffer.from(JSON.stringify(firstManifest)))
+    const outcome = await runAndRelease(reader)
+    check('a shard written earlier than the one already applied is not applied', outcome.pulled === 0 && totalInput(rollStore) === 400, JSON.stringify({ pulled: outcome.pulled, rows: outcome.rows, dropped: outcome.dropped, failed: outcome.failed?.length ?? 0, total: totalInput(rollStore), result: outcome.result }).slice(0, 200))
+    check('...and the reader is left on the newer version', outcome.result === 'ok', JSON.stringify({ result: outcome.result, message: outcome.message }))
+    writerStore.close()
+    rollStore.close()
+    await rollServer.close()
+  }
+
+  // ── 13. a directory whose owner cannot be established ──────────────────────
+  //
+  // A directory that exists but whose manifest cannot be read is not "nothing there": nobody knows whose it
+  // is, and that is exactly when writing into it is most dangerous. The instanceId guard has nothing to look
+  // at, so the directory itself has to count as occupied — unless this device has published here before, in
+  // which case the torn manifest is its own and repairing it is the point.
+  {
+    const blindServer = await startFakeWebDav()
+    const blindClient = () => new WebDavClient({ baseUrl: blindServer.url, username: 'alice', passwordHash: credential.ha1 })
+    blindServer.state.collections.add('/usage-badge/')
+    blindServer.state.collections.add('/usage-badge/blind/')
+    blindServer.state.files.set('/usage-badge/blind/index.json', Buffer.from('{ this is not json'))
+
+    const blindHome = makeHome('engine-blind')
+    const blindStore = openStore(blindHome)
+    seed(blindStore, '2026-09-01', 300, 'blind-1')
+    const blind = new SyncEngine({ dataDir: storeRoot(blindHome), store: blindStore, client: blindClient(), now: () => 40_000, instanceId: 'inst-blind' })
+    blind.save({ config: { ...credential, url: blindServer.url, deviceId: 'blind' } })
+    const refused = await runAndRelease(blind)
+    check('a directory whose manifest cannot be read is not written into', refused.result === 'clash' && refused.refused === 'unreadable', JSON.stringify({ result: refused.result, collision: blind.state.collision }))
+    check('...so its contents are untouched', blindServer.state.files.get('/usage-badge/blind/index.json').toString('utf8') === '{ this is not json', 'the manifest was overwritten')
+    // …but a device that has published there before repairs it: this is its own torn write, not a stranger.
+    blind.state.published = { '2026-09': { key: '2026-09', sha256: 'x'.repeat(64) } }
+    const repaired = await runAndRelease(blind)
+    check('...while a device that published there before repairs its own manifest', repaired.refused == null && repaired.pushed === 1, JSON.stringify({ refused: repaired.refused, pushed: repaired.pushed, result: repaired.result }))
+    blindStore.close()
+    await blindServer.close()
+  }
+
+  // ── 14. two names that differ only in case ─────────────────────────────────
+  {
+    const caseServer = await startFakeWebDav()
+    const caseClient = () => new WebDavClient({ baseUrl: caseServer.url, username: 'alice', passwordHash: credential.ha1 })
+    const firstHome = makeHome('engine-case-1')
+    const firstStore = openStore(firstHome)
+    seed(firstStore, '2026-09-02', 500, 'case-1')
+    const lower = new SyncEngine({ dataDir: storeRoot(firstHome), store: firstStore, client: caseClient(), now: () => 41_000, instanceId: 'inst-case-a' })
+    lower.save({ config: { ...credential, url: caseServer.url, deviceId: 'desk' } })
+    await runAndRelease(lower)
+
+    const secondHome = makeHome('engine-case-2')
+    const secondStore = openStore(secondHome)
+    seed(secondStore, '2026-09-03', 600, 'case-2')
+    const upper = new SyncEngine({ dataDir: storeRoot(secondHome), store: secondStore, client: caseClient(), now: () => 41_100, instanceId: 'inst-case-b' })
+    upper.save({ config: { ...credential, url: caseServer.url, deviceId: 'Desk' } })
+    const outcome = await runAndRelease(upper)
+    check('a name that differs only in case is refused, not merged', outcome.result === 'clash' && upper.state.collision?.kind === 'case', JSON.stringify({ result: outcome.result, collision: upper.state.collision }))
+    check('...and the existing directory is untouched', caseServer.state.files.has('/usage-badge/desk/2026-09.ndjson.zst') && !caseServer.state.files.has('/usage-badge/Desk/2026-09.ndjson.zst'), [...caseServer.state.files.keys()].join(','))
+    firstStore.close()
+    secondStore.close()
+    await caseServer.close()
+  }
+
+  // ── 15. a run told to stop ─────────────────────────────────────────────────
+  {
+    const stopServer = await startFakeWebDav()
+    const stopClient = () => new WebDavClient({ baseUrl: stopServer.url, username: 'alice', passwordHash: credential.ha1 })
+    const stopHome = makeHome('engine-stop')
+    const stopStore = openStore(stopHome)
+    seed(stopStore, '2026-09-04', 700, 'stop-1')
+    const engine = new SyncEngine({ dataDir: storeRoot(stopHome), store: stopStore, client: stopClient(), now: () => 42_000, instanceId: 'inst-stop' })
+    engine.save({ config: { ...credential, url: stopServer.url, deviceId: 'stop' } })
+    engine.abort()
+    const outcome = await runAndRelease(engine)
+    check('a run told to stop before it starts reports that, and writes nothing', outcome.result === 'aborted' && stopServer.state.requests.length === 0, JSON.stringify({ result: outcome.result, requests: stopServer.state.requests.length }))
+    stopStore.close()
+    await stopServer.close()
+  }
+
   // ── 9. a shard that fails to arrive is not remembered as applied ───────────
   seed(a, '2026-11-05', 777, 'a-november')
   await runAndRelease(engineA)
