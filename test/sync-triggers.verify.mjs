@@ -363,4 +363,62 @@ const writeSync = (home, config) => {
   }
 }
 
+// ── 7. with sync off, not one request and not one file ──────────────────────
+//
+// The promise the whole feature rests on: a home that never turned sync on (or turned it off again) is not
+// touched — no `sync.json`, no lock, no network. Every trigger checks `enabled` before doing anything, and
+// this is the test that says so out loud, including the case that is easiest to get wrong: a home that **was**
+// configured once (url and ha1 present) and then switched off.
+{
+  const server = await startFakeWebDav()
+  const home = makeHome('trigger-all-off')
+  writeSync(home, {
+    enabled: false, // configured once, then switched off
+    url: server.url,
+    username: 'alice',
+    ha1,
+    realm: 'WebDAV',
+    deviceId: 'off-device',
+    instanceId: 'trigger-all-off',
+    windowYears: 5,
+    state: {},
+  })
+  // Something to publish, so a missing check would show up as a request rather than as "nothing to do".
+  writeSession(home, 'off-1', { provider: 'p', model: 'm', time: Date.now(), input: 4242 })
+  process.env.DSH_USAGE_BADGE_STARTUP_SYNC_MS = '20'
+  process.env.DSH_USAGE_BADGE_PRICING_PUSH_MS = '20'
+  process.env.DSH_USAGE_BADGE_EXIT_SYNC_MS = '2000'
+  try {
+    const { call, settle, dispose } = await mount(home, 'trigger-all-off-1')
+    await settle()
+    await new Promise((resolve) => setTimeout(resolve, 250)) // well past the startup delay
+    check('sync off: the startup trigger sends nothing', server.state.requests.length === 0, `${server.state.requests.length} request(s)`)
+
+    const saved = await call('POST', '/usage-badge/config', { modelPrefixFallback: false })
+    await new Promise((resolve) => setTimeout(resolve, 250)) // well past the pricing-push delay
+    check('...and a price edit stays a local edit', saved.status === 200 && server.state.requests.length === 0, `${server.state.requests.length} request(s)`)
+
+    await dispose()
+    check('...and unloading sends nothing either', server.state.requests.length === 0, `${server.state.requests.length} request(s)`)
+    const files = readdirSync(join(home, DATA_DIR))
+    check('...and no lock was ever taken', !files.includes('host.lock'), files.join(','))
+
+    // Opening the sync tab is what creates the lock and the device id — that is "engaging with sync", by
+    // design — but it must still not let any automatic trigger fire.
+    const opened = await mount(home, 'trigger-all-off-2')
+    await opened.settle()
+    await opened.call('GET', '/usage-badge/sync')
+    const before = server.state.requests.length
+    await new Promise((resolve) => setTimeout(resolve, 250))
+    check('sync off: opening the tab still triggers nothing', server.state.requests.length === before, `${server.state.requests.length - before} request(s) after opening`)
+    await opened.dispose()
+    check('...not even on unload', server.state.requests.length === before, `${server.state.requests.length - before} request(s) after unloading`)
+  } finally {
+    delete process.env.DSH_USAGE_BADGE_STARTUP_SYNC_MS
+    delete process.env.DSH_USAGE_BADGE_PRICING_PUSH_MS
+    delete process.env.DSH_USAGE_BADGE_EXIT_SYNC_MS
+    await server.close()
+  }
+}
+
 await finish()
