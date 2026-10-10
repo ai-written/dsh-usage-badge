@@ -17,7 +17,7 @@
  *   node test/sync-triggers.verify.mjs
  */
 
-import { mkdirSync, readdirSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, readdirSync, writeFileSync } from 'node:fs'
 import { createHash } from 'node:crypto'
 import { join } from 'node:path'
 
@@ -161,6 +161,64 @@ const writeSync = (home, config) => {
     delete process.env.DSH_USAGE_BADGE_STARTUP_SYNC_MS
   } finally {
     // nothing to close
+  }
+}
+
+// ── 5. unloading stops the automatic work, even before the first fold finishes ─
+//
+// `apply()` returns before `warm()` resolves, so an unload in that window used to let the callback run
+// anyway: it scheduled the first sync *after* the unload, took the lock back, and synced through a store
+// that had already been closed — leaving `host.lock` behind for a host that was gone, and a re-mount refused
+// by its own lock.
+{
+  const strayHome = makeHome('trigger-stray')
+  writeSync(strayHome, {
+    enabled: true,
+    url: 'http://127.0.0.1:9/',
+    username: 'alice',
+    ha1,
+    realm: 'WebDAV',
+    deviceId: 'stray',
+    instanceId: 'trigger-stray',
+    windowYears: 5,
+    state: {},
+  })
+  process.env.DSH_USAGE_BADGE_STARTUP_SYNC_MS = '60'
+  const { dispose } = await mount(strayHome, 'trigger-stray-1')
+  dispose() // immediately: the fold has not finished yet
+  delete process.env.DSH_USAGE_BADGE_STARTUP_SYNC_MS
+  await new Promise((resolve) => setTimeout(resolve, 400))
+  const files = readdirSync(join(strayHome, DATA_DIR))
+  check('unloading before the first fold finishes schedules nothing', !files.includes('host.lock'), files.join(','))
+}
+
+// A run that is already in flight when the host unloads must not leave the lock behind either. The engine
+// declines to release a lock the host handed it (`ownsLock`), so the disposer removes it itself.
+{
+  const server = await startFakeWebDav({ delayMs: 150 })
+  const home = makeHome('trigger-inflight')
+  writeSync(home, {
+    enabled: true,
+    url: server.url,
+    username: 'alice',
+    ha1,
+    realm: 'WebDAV',
+    deviceId: 'inflight',
+    instanceId: 'trigger-inflight',
+    windowYears: 5,
+    state: {},
+  })
+  process.env.DSH_USAGE_BADGE_STARTUP_SYNC_MS = '600000'
+  try {
+    const { call, dispose } = await mount(home, 'trigger-inflight-1')
+    const running = call('POST', '/usage-badge/sync/run') // deliberately not awaited: it is in flight
+    await until(() => server.state.requests.length > 0, { timeoutMs: 3000 })
+    dispose()
+    check('unloading during a run releases the lock', !existsSync(join(home, DATA_DIR, 'host.lock')), 'the lock was left behind')
+    await running.catch(() => {})
+  } finally {
+    delete process.env.DSH_USAGE_BADGE_STARTUP_SYNC_MS
+    await server.close()
   }
 }
 

@@ -129,7 +129,9 @@ export async function mount(root, scenario) {
     if (!route) throw new Error('the plugin registered no route')
 
     call = async (method = 'GET', path = '/usage-badge/summary', payload) => {
-      const body = payload === undefined ? undefined : JSON.stringify(payload)
+      // A **string** payload is sent verbatim, so a test can hand a route a body that is not JSON at all.
+      // Anything else is serialised, which is what every other caller means by passing an object.
+      const body = payload === undefined ? undefined : typeof payload === 'string' ? payload : JSON.stringify(payload)
       let responseBody = ''
       let status = 0
       await route.handler(

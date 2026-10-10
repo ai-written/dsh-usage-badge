@@ -172,23 +172,45 @@ try {
     engineR.save({ config: { deviceId: 'after-name' } })
     const publishAfter = await runAndRelease(engineR)
     check('renaming publishes under the new name', renameServer.state.files.has('/usage-badge/after-name/2026-12.ndjson.zst'), [...renameServer.state.files.keys()].join(','))
-    check('...leaving the old directory alone, as a remote always is', renameServer.state.files.has('/usage-badge/before-name/2026-12.ndjson.zst'), [...renameServer.state.files.keys()].join(','))
+    // The old directory is **emptied of this installation's months**, not left behind: every reader treats
+    // every manifest it finds as authoritative, so a stale copy under the old name keeps feeding readers
+    // rows this machine has since corrected or dropped. One installation's months live in one directory.
+    const oldManifest = JSON.parse(renameServer.state.files.get('/usage-badge/before-name/index.json').toString('utf8'))
+    check('...the old directory stops advertising this installation’s months', Object.keys(oldManifest.chunks).length === 0, JSON.stringify(Object.keys(oldManifest.chunks)))
+    check('...and its stale shard is gone, so no reader can pick it up', renameServer.state.files.has('/usage-badge/before-name/2026-12.ndjson.zst') === false, [...renameServer.state.files.keys()].join(','))
     check('...so the renamed device still counts its own history once', totalInput(r) === 10000, String(totalInput(r)))
 
-    // The machine that has to be sure: nothing of its own, so it takes the server as it is — both names.
+    // The machine that has to be sure: nothing of its own, so it takes the server as it is.
     const rootR2 = makeHome('engine-rename-reader')
     const r2 = openStore(rootR2)
     const reader = new SyncEngine({ dataDir: storeRoot(rootR2), store: r2, client: renameClient(), now: () => 5000, instanceId: 'instance-r2' })
     reader.save({ config: { ...credential, url: renameServer.url, deviceId: 'reader' } })
     const readerRun = await runAndRelease(reader)
     check('...and a third machine sees the total once, not twice', readerRun.result === 'ok' && totalInput(r2) === 10000, `${totalInput(r2)} (16666 would be double-counted)`)
-    check('...holding a row from each name for the same session and day', r2.scan().length === 2 && r2.scan().every((record) => record.rows.length === 2 && new Set(record.rows.map((row) => row.source)).size === 2), JSON.stringify(r2.scan().map((record) => record.rows.map((row) => row.source))))
-    // Resolution is what keeps that at one: the two rows are the same session on the same day, so the
-    // store's read resolves them to a single day. The duplicates cost storage, never a number.
+    check('...holding it under the current name only', r2.scan().length === 2 && r2.scan().every((record) => record.rows.every((row) => row.source === 'after-name')), JSON.stringify(r2.scan().map((record) => record.rows.map((row) => row.source))))
     const againR = await runAndRelease(reader)
     check('...and nothing moves on the next run', againR.pulled === 0 && againR.pushed === 0 && totalInput(r2) === 10000, JSON.stringify({ pulled: againR.pulled, pushed: againR.pushed, total: totalInput(r2) }))
+
+    // ── the case that made the old name dangerous: a correction **after** the rename ──
+    //
+    // A month can stay while one of its rows goes away (a newer log version that no longer covers that day),
+    // so a key-vs-key test sees nothing wrong — but a stale shard under the old name would still hold the
+    // dropped day, and a new machine would import it. Measured before the fix: the device held 100 and a
+    // fresh reader counted 300. The invariant that has to hold, whatever happens after the rename, is that a
+    // machine with nothing of its own reads exactly what the device holds.
+    r.put(recordOf('r-2', [['2026-12-03', [['p|m', bucket('p', 'm', 8766)]]]]), { at: 30 })
+    const corrected = await runAndRelease(engineR)
+    check('a correction after the rename publishes normally', corrected.result === 'ok' && corrected.pushed >= 1, JSON.stringify({ result: corrected.result, pushed: corrected.pushed, message: corrected.message }))
+    check('...and the old directory is still advertising nothing', Object.keys(JSON.parse(renameServer.state.files.get('/usage-badge/before-name/index.json').toString('utf8')).chunks).length === 0, renameServer.state.files.get('/usage-badge/before-name/index.json').toString('utf8'))
+    const rootR3 = makeHome('engine-rename-reader-2')
+    const r3 = openStore(rootR3)
+    const reader3 = new SyncEngine({ dataDir: storeRoot(rootR3), store: r3, client: renameClient(), now: () => 5500, instanceId: 'instance-r3' })
+    reader3.save({ config: { ...credential, url: renameServer.url, deviceId: 'reader-3' } })
+    await runAndRelease(reader3)
+    check('...so a fresh machine counts exactly what the device holds', totalInput(r3) === totalInput(r), `${totalInput(r3)} vs the device's ${totalInput(r)}`)
     r.close()
     r2.close()
+    r3.close()
     await renameServer.close()
   }
 
@@ -337,6 +359,26 @@ try {
     retireStore.close()
     readerStore.close()
     await retireServer.close()
+  }
+
+  // ── 10. a run that did not happen does not move the clock ──────────────────
+  //
+  // `locked` and `skipped` both mean nothing was synced, and the panel's first line is "上次同步". Stamping
+  // the time for either would show "刚才" for a run that never happened — and the host reads this value
+  // rather than its own clock, so the engine is the only place that can get it right.
+  {
+    const quietHome = makeHome('engine-quiet')
+    const quietStore = openStore(quietHome)
+    const engine = new SyncEngine({ dataDir: storeRoot(quietHome), store: quietStore, client: client(), now: () => 12_345, instanceId: 'instance-quiet' })
+    engine.save({ config: { ...credential, deviceId: 'quiet', enabled: false } })
+    const skipped = await runAndRelease(engine)
+    check('a run with sync turned off reports skipped', skipped.result === 'skipped', JSON.stringify(skipped))
+    check('...and leaves the last-sync clock alone', !engine.state.lastSyncAt, JSON.stringify(engine.state.lastSyncAt))
+
+    engine.save({ config: { enabled: true } })
+    const okay = await runAndRelease(engine)
+    check('...while a real run does record when it happened', okay.result === 'ok' && engine.state.lastSyncAt === 12_345, JSON.stringify({ result: okay.result, at: engine.state.lastSyncAt }))
+    quietStore.close()
   }
 
   // ── 9. a shard that fails to arrive is not remembered as applied ───────────

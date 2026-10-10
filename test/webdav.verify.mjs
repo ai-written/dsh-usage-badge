@@ -18,11 +18,76 @@
 
 import { createHash } from 'node:crypto'
 
-import { WebDavClient, buildAuthorization, parseChallenge, unsupportedChallenge } from '../lib/webdav.js'
+import { WebDavClient, buildAuthorization, normalizeWebdavUrl, parseChallenge, unsupportedChallenge } from '../lib/webdav.js'
 import { startFakeWebDav } from './webdav-server.mjs'
 import { createChecker } from './helpers.mjs'
 
 const { check, finish } = createChecker('webdav (Digest client)')
+
+/**
+ * The save route and the client must agree on every address.
+ *
+ * They had a copy of this rule each, and the copies drifted: the route accepted a query string, embedded
+ * credentials, `ftp:` and a newline — addresses the client then refused — so the panel stored one, showed
+ * it in its own field, and the sync could not run at all. The invariant is one-directional and that is the
+ * point: **whatever the client refuses, the route must refuse too**. Normalisation (the trailing slash) is
+ * the one case where the route is more permissive, and only because it hands the client the fixed address.
+ */
+{
+  const addresses = [
+    'http://nas:19347/',
+    'http://nas:19347',
+    'https://nas.example/dav',
+    'https://nas.example/dav/',
+    'http://nas:19347/dav?x=1',
+    'http://nas:19347/dav#frag',
+    'http://user:pw@nas:19347/dav/',
+    'ftp://nas:19347/dav/',
+    'nas:19347/dav/',
+    'not a url',
+    'http://nas:19347/dav/../other/',
+    '',
+  ]
+  const disagreements = []
+  for (const address of addresses) {
+    const judged = normalizeWebdavUrl(address)
+    let clientAccepts = true
+    try {
+      new WebDavClient({ baseUrl: address, username: 'u', passwordHash: '0'.repeat(32) })
+    } catch {
+      clientAccepts = false
+    }
+    // The saved form (what the route would store) must be usable by the client.
+    let savedUsable = false
+    if (judged.ok) {
+      try {
+        new WebDavClient({ baseUrl: judged.url, username: 'u', passwordHash: '0'.repeat(32) })
+        savedUsable = true
+      } catch {
+        savedUsable = false
+      }
+    }
+    if (!judged.ok && clientAccepts) disagreements.push(`${JSON.stringify(address)}: route refuses, client accepts`)
+    if (judged.ok && !savedUsable) disagreements.push(`${JSON.stringify(address)}: route stores ${judged.url}, client refuses it`)
+    if (judged.ok && !clientAccepts && address !== 'http://nas:19347' && address !== 'https://nas.example/dav') {
+      // Only the "add the slash" cases may differ, and only in that direction.
+      disagreements.push(`${JSON.stringify(address)}: route accepts a raw form the client refuses`)
+    }
+  }
+  check('the save route and the client agree on every address', disagreements.length === 0, disagreements.join(' | '))
+  check('...the trailing slash is added rather than demanded', normalizeWebdavUrl('http://nas:19347/dav').url === 'http://nas:19347/dav/', JSON.stringify(normalizeWebdavUrl('http://nas:19347/dav')))
+  // A bare host is **already** a collection: `new URL('http://nas:19347').pathname` is `/`, so nothing is
+  // appended and the stored address is the one that was typed. (Assuming an empty pathname here once led me
+  // to "fix" a doubling that could not happen.)
+  check('...without touching an address that is already a collection', normalizeWebdavUrl('http://nas:19347').url === 'http://nas:19347/', JSON.stringify(normalizeWebdavUrl('http://nas:19347')))
+  check('...or one with a path that already ends in a slash', normalizeWebdavUrl('http://nas/dav/').url === 'http://nas/dav/', JSON.stringify(normalizeWebdavUrl('http://nas/dav/')))
+  check(
+    '...while the client still refuses a path that lacks the slash',
+    normalizeWebdavUrl('http://nas/dav', { allowTrailingSlashFix: false }).ok === false,
+    JSON.stringify(normalizeWebdavUrl('http://nas/dav', { allowTrailingSlashFix: false })),
+  )
+  check('...and a plain-http address is reported as such', normalizeWebdavUrl('http://nas/').insecure === true && normalizeWebdavUrl('https://nas/').insecure === false)
+}
 
 const md5 = (value) => createHash('md5').update(value).digest('hex')
 

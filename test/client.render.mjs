@@ -771,6 +771,13 @@ const renderSyncPanelMarkup = (initialSync) => render({ initialSnapshot: snapsho
   const zero = fillSyncForm({ config: { windowYears: 0 } }, {})
   check('a zero window is carried through, not treated as unset', zero.windowYears === '0', JSON.stringify(zero))
   check('an unset window is left to the field’s own default', fillSyncForm({ config: {} }, {}).windowYears === undefined)
+
+  // A 200 that is not a status: the route answers `{error}` when it cannot produce one, and adopting that
+  // would blank every field — the complaint this tab already had, arriving by a second road.
+  const { isSyncStatus } = plugin
+  check('a reply with no configuration is not a status', isSyncStatus({ error: 'reading the sync status took longer than 5s' }) === false)
+  check('...nor is null or a non-object', isSyncStatus(null) === false && isSyncStatus('ok') === false && isSyncStatus({ config: null }) === false)
+  check('...while a real status is one', isSyncStatus({ config: {}, last: {} }) === true)
 }
 
 // A provider row whose hourly series is empty must still render its tab and must

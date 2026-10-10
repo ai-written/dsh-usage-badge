@@ -65,6 +65,8 @@ export async function startFakeWebDav(options = {}) {
     staleOnce: false,
     algorithm: 'MD5',
     scheme: 'Digest',
+    /** Hold every response this long, so a test can observe work that is still in flight. */
+    delayMs: 0,
     ...options,
   }
   const state = {
@@ -133,6 +135,11 @@ export async function startFakeWebDav(options = {}) {
       const path = decodePath(uri.split('?')[0])
       const method = req.method.toUpperCase()
       state.requests.push({ method, path, body: body.length })
+      // A slow server, for the cases about work that is still in flight when something else happens.
+      if (config.delayMs > 0) setTimeout(() => respond(), config.delayMs)
+      else respond()
+
+      function respond() {
 
       /** Record the header a failing test can inspect, without keeping credentials. */
       const fields = parseAuthorization(req.headers.authorization)
@@ -258,6 +265,7 @@ export async function startFakeWebDav(options = {}) {
         return
       }
       send(405)
+      }
     })
   })
 

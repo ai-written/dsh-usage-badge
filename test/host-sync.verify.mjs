@@ -88,6 +88,11 @@ try {
   const badDevice = await call('POST', '/usage-badge/sync', { deviceId: 'a/b' })
   check('a device id with a slash is refused', badDevice.status === 400, JSON.stringify(badDevice.body))
 
+  // A body that is not JSON is the caller's mistake, not the host's: a 500 for it sends whoever is debugging
+  // it looking at the wrong process. (The helper sends a string payload verbatim for exactly this.)
+  const malformed = await call('POST', '/usage-badge/sync', '{not json')
+  check('a malformed body is answered 400, not 500', malformed.status === 400 && /not JSON/.test(String(malformed.body.error)), `${malformed.status} ${JSON.stringify(malformed.body).slice(0, 90)}`)
+
   // ── 2b. a password saves without the panel having to know the realm ──────
   //
   // The realm is part of the digest input, but it is not a field the panel offers — someone filling in an
@@ -216,6 +221,26 @@ try {
     check('the status does not carry a plaintext password from an older build', !serialised.includes('plaintext-from-an-older-build') && !('password' in status.body.config), JSON.stringify(Object.keys(status.body.config)))
     check('...nor the HA1, only that one exists', !serialised.includes('a'.repeat(32)) && status.body.config.hasCredential === true, status.body.config.credentialPrefix)
     check('...and the credential prefix is still just a prefix', /^[0-9a-f]{6}…$/.test(status.body.config.credentialPrefix), status.body.config.credentialPrefix)
+    // A six-character slice of a short value **is** the whole value. A hand-edited or truncated `ha1` must
+    // not be shown by a field whose entire purpose is to show only part of one. (A home of its own: the
+    // running system holds its configuration in memory, so editing this one's file would not be re-read.)
+    const shortHome = makeHome('host-sync-short')
+    const shortDir = join(shortHome, DATA_DIR)
+    mkdirSync(shortDir, { recursive: true })
+    writeFileSync(join(shortDir, 'sync.json'), JSON.stringify({ enabled: true, url: 'http://nas/', username: 'alice', ha1: 'abc123', deviceId: 'desk' }))
+    const { call: shortCall } = await mount(shortHome, 'host-sync-short-1')
+    const shortStatus = await shortCall('GET', '/usage-badge/sync')
+    check('...while a short credential is shown as nothing at all', shortStatus.body.config.credentialPrefix === '' && shortStatus.body.config.hasCredential === true, JSON.stringify(shortStatus.body.config.credentialPrefix))
+
+    // `password` / `passwordHash` are fields an older build could leave behind, and `connect()` can use
+    // neither. Claiming a credential exists enables 立即同步 and then fails the moment it is pressed.
+    const legacyHome = makeHome('host-sync-legacy')
+    const legacyDir = join(legacyHome, DATA_DIR)
+    mkdirSync(legacyDir, { recursive: true })
+    writeFileSync(join(legacyDir, 'sync.json'), JSON.stringify({ enabled: true, url: 'http://nas/', username: 'alice', password: 'plaintext', deviceId: 'desk' }))
+    const { call: legacyCall } = await mount(legacyHome, 'host-sync-legacy-1')
+    const legacyStatus = await legacyCall('GET', '/usage-badge/sync')
+    check('...and a credential field this build cannot use is not reported as one', legacyStatus.body.config.hasCredential === false, JSON.stringify(legacyStatus.body.config.hasCredential))
   } finally {
     delete process.env.DSH_USAGE_BADGE_STARTUP_SYNC_MS
   }
@@ -279,6 +304,34 @@ try {
     check('...so the same data directory can be claimed again', after.body.writable === true && after.body.lock === null, JSON.stringify({ writable: after.body.writable, lock: after.body.lock }))
   } finally {
     delete process.env.DSH_USAGE_BADGE_STARTUP_SYNC_MS
+  }
+}
+
+// ── 10. a server that does not use the default realm ────────────────────────
+//
+// The panel has no realm field, so the password is hashed against `WebDAV` unless something tells it
+// otherwise. On a server with a different realm that guess is wrong and **nothing** works — so the failed
+// connection check has to hand back the realm the server announced, or the user has no way to find out what
+// the right one is.
+{
+  const otherServer = await startFakeWebDav({ realm: 'Our Files' })
+  const realmHome = makeHome('host-sync-other-realm')
+  const realmDir = join(realmHome, DATA_DIR)
+  mkdirSync(realmDir, { recursive: true })
+  writeFileSync(join(realmDir, 'sync.json'), JSON.stringify({ enabled: true, url: otherServer.url, username: 'alice', ha1: md5('alice:WebDAV:secret1234'), realm: 'WebDAV', deviceId: 'desk', instanceId: 'host-sync-other-realm' }))
+  process.env.DSH_USAGE_BADGE_STARTUP_SYNC_MS = '600000'
+  try {
+    const { call: realmCall } = await mount(realmHome, 'host-sync-other-realm-1')
+    const failed = await realmCall('POST', '/usage-badge/sync/test')
+    check('a check against a different realm fails', failed.body.ok === false, JSON.stringify(failed.body).slice(0, 90))
+    check('...and reports the realm the server announced', failed.body.realm === 'Our Files', JSON.stringify(failed.body.realm))
+    // With that realm the same password works — which is what the panel's hint tells the user to do.
+    const fixed = await realmCall('POST', '/usage-badge/sync', { realm: 'Our Files', password: 'secret1234' })
+    const ok = await realmCall('POST', '/usage-badge/sync/test')
+    check('...and re-entering the password against it succeeds', fixed.status === 200 && ok.body.ok === true, JSON.stringify({ fixed: fixed.status, ok: ok.body.ok, error: ok.body.error }))
+  } finally {
+    delete process.env.DSH_USAGE_BADGE_STARTUP_SYNC_MS
+    await otherServer.close()
   }
 }
 
