@@ -403,14 +403,15 @@ const writeSync = (home, config) => {
     const files = readdirSync(join(home, DATA_DIR))
     check('...and no lock was ever taken', !files.includes('host.lock'), files.join(','))
 
-    // Opening the sync tab is what creates the lock and the device id — that is "engaging with sync", by
-    // design — but it must still not let any automatic trigger fire.
+    // Opening the sync tab is looking, not deciding: it must not create `sync.json` or take the lock, and it
+    // must not let any automatic trigger fire.
     const opened = await mount(home, 'trigger-all-off-2')
     await opened.settle()
     await opened.call('GET', '/usage-badge/sync')
     const before = server.state.requests.length
+    check('sync off: opening the tab still creates nothing', !readdirSync(join(home, DATA_DIR)).includes('host.lock'), readdirSync(join(home, DATA_DIR)).join(','))
     await new Promise((resolve) => setTimeout(resolve, 250))
-    check('sync off: opening the tab still triggers nothing', server.state.requests.length === before, `${server.state.requests.length - before} request(s) after opening`)
+    check('...triggers nothing', server.state.requests.length === before, `${server.state.requests.length - before} request(s) after opening`)
     await opened.dispose()
     check('...not even on unload', server.state.requests.length === before, `${server.state.requests.length - before} request(s) after unloading`)
   } finally {

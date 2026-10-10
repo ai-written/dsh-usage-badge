@@ -41,8 +41,19 @@ try {
   const initial = await call('GET', '/usage-badge/sync')
   check('reading the sync status answers with defaults', initial.status === 200 && initial.body.config.url === '' && initial.body.last.result === 'never', JSON.stringify(initial.body?.config))
   check('...and says nothing is configured yet', initial.body.config.hasCredential === false, JSON.stringify({ hasCredential: initial.body.config.hasCredential }))
-  check('...having created only the lock and its own device identity, no remote access', existsSync(join(dataDir, 'host.lock')) && !existsSync(join(dataDir, 'pricing.json')), JSON.stringify({ lock: existsSync(join(dataDir, 'host.lock')) }))
-  check('...and reporting itself as the writer', initial.body.writable === true && initial.body.lock === null, JSON.stringify({ writable: initial.body.writable, lock: initial.body.lock }))
+  // **Looking is not deciding.** Reading the status must not take the lock or write `sync.json`: someone who
+  // opened the tab to see what it says has not asked to sync, and "it wrote a file because I looked at it" is
+  // exactly the surprise this avoids. The lock is claimed by the first action that decides something.
+  check(
+    '...and reading it creates nothing at all',
+    !existsSync(join(dataDir, 'sync.json')) && !existsSync(join(dataDir, 'host.lock')) && !existsSync(join(dataDir, 'pricing.json')),
+    JSON.stringify({ sync: existsSync(join(dataDir, 'sync.json')), lock: existsSync(join(dataDir, 'host.lock')) }),
+  )
+  check('...while still reporting itself as free to write', initial.body.writable === true && initial.body.lock === null, JSON.stringify({ writable: initial.body.writable, lock: initial.body.lock }))
+  // The first thing that decides anything is what creates the state — and from then on the lock is ours.
+  const claimed = await call('POST', '/usage-badge/sync', { deviceLabel: 'first-look' })
+  check('...and the first save is what creates it', claimed.status === 200 && existsSync(join(dataDir, 'sync.json')) && existsSync(join(dataDir, 'host.lock')), JSON.stringify({ sync: existsSync(join(dataDir, 'sync.json')), lock: existsSync(join(dataDir, 'host.lock')) }))
+  check('...with the lock naming this process', readLock(dataDir)?.pid === process.pid, JSON.stringify(readLock(dataDir)))
 
   // ── 2. the credential is hashed here, not stored in plaintext ────────────
   const saved = await call('POST', '/usage-badge/sync', {
@@ -305,7 +316,8 @@ try {
   process.env.DSH_USAGE_BADGE_STARTUP_SYNC_MS = '600000'
   try {
     const { call: unloadCall, settle, dispose } = await mount(unloadHome, 'host-sync-unload-1')
-    await unloadCall('GET', '/usage-badge/sync')
+    // A save is the action that claims the directory — reading the status deliberately does not.
+    await unloadCall('POST', '/usage-badge/sync', { deviceLabel: 'unload-check' })
     check('a live host holds the lock', existsSync(join(unloadDir, 'host.lock')) && readLock(unloadDir)?.pid === process.pid, JSON.stringify(readLock(unloadDir)))
     await settle()
     await dispose()
