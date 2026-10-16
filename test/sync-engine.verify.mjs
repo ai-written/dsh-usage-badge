@@ -656,4 +656,130 @@ function recorded(hash) {
   return `${String(hash).slice(0, 8)}…`
 }
 
+// ── 16. a run that imported and then failed still reports the store moved ────
+//
+// The host decides whether to reload its in-memory view from `storeChanged`, and that flag has to survive
+// the failure paths: a pull whose rows landed and whose *publish* then failed has already made the host's
+// numbers stale. `rows` cannot answer this question — a shard that decodes short is imported and still
+// reported as a failure — so the flag is set at the two places that actually touch the store.
+{
+  const failServer = await startFakeWebDav()
+  const toFailServer = () => new WebDavClient({ baseUrl: failServer.url, username: 'alice', passwordHash: credential.ha1 })
+  const publishHome = makeHome('engine-fail-publish')
+  const publishStore = openStore(publishHome)
+  seed(publishStore, '2026-08-09', 4321, 'fail-seed')
+  const publisher = new SyncEngine({ dataDir: storeRoot(publishHome), store: publishStore, client: toFailServer(), now: () => 50_000, instanceId: 'inst-fail-pub' })
+  publisher.save({ config: { ...credential, url: failServer.url, deviceId: 'fail-origin' } })
+  const published = await runAndRelease(publisher)
+  check('the fixture device publishes its month', published.result === 'ok' && published.pushed === 1, JSON.stringify(published).slice(0, 140))
+
+  const readerHome = makeHome('engine-fail-reader')
+  const readerStore = openStore(readerHome)
+  // Everything the pull needs works; every upload is refused. That is the order `run()` imposes — pull
+  // first — so the rows are already in the store when the failure is reported.
+  const refusingUploads = () => {
+    const inner = toFailServer()
+    return {
+      get: (path) => inner.get(path),
+      propfind: (path) => inner.propfind(path),
+      options: () => inner.options(),
+      mkcol: (path) => inner.mkcol(path),
+      delete: (path) => inner.delete(path),
+      move: (from, to, options) => inner.move(from, to, options),
+      put: async () => {
+        throw new Error('the server refused the upload')
+      },
+    }
+  }
+  const reader = new SyncEngine({ dataDir: storeRoot(readerHome), store: readerStore, client: refusingUploads(), now: () => 50_100, instanceId: 'inst-fail-reader' })
+  reader.save({ config: { ...credential, url: failServer.url, deviceId: 'fail-reader' } })
+  const failed = await runAndRelease(reader)
+  check('a publish that fails after the pull is reported as a failure', failed.result === 'failed' && /refused the upload/.test(failed.message), JSON.stringify({ result: failed.result, message: failed.message }).slice(0, 160))
+  check('...but the rows really arrived', totalInput(readerStore) === 4321, String(totalInput(readerStore)))
+  check('...so the run tells the host its aggregate is stale', failed.storeChanged === true, JSON.stringify({ storeChanged: failed.storeChanged }))
+  readerStore.close()
+  publishStore.close()
+  await failServer.close()
+}
+
+// ── 17. two more ways a run ends without `ok`, with rows already moved ───────
+//
+// Both are about the same flag, and neither can be answered by `rows`: a cancel that lands mid-pull leaves
+// the imported rows in the store (the request was already made, and its rows are the point), and a shard
+// that holds fewer rows than its manifest names is imported *and* reported as a failure so the reader keeps
+// asking. A host that stays alive still has to catch up in both cases; the unload path is the one that
+// declines, using its own `syncAbort`.
+{
+  // (a) a cancel while a shard is on the wire
+  const cancelServer = await startFakeWebDav()
+  const toCancelServer = () => new WebDavClient({ baseUrl: cancelServer.url, username: 'alice', passwordHash: credential.ha1 })
+  const cancelWriterHome = makeHome('engine-cancel-writer')
+  const cancelWriterStore = openStore(cancelWriterHome)
+  seed(cancelWriterStore, '2026-06-06', 1234, 'cancel-1')
+  const cancelWriter = new SyncEngine({ dataDir: storeRoot(cancelWriterHome), store: cancelWriterStore, client: toCancelServer(), now: () => 52_000, instanceId: 'inst-cancel-w' })
+  cancelWriter.save({ config: { ...credential, url: cancelServer.url, deviceId: 'cancel-writer' } })
+  const cancelPublished = await runAndRelease(cancelWriter)
+  check('the fixture device publishes its month', cancelPublished.result === 'ok' && cancelPublished.pushed === 1, JSON.stringify(cancelPublished).slice(0, 120))
+
+  const cancelReaderHome = makeHome('engine-cancel-reader')
+  const cancelReaderStore = openStore(cancelReaderHome)
+  let cancelReader = null
+  const cancelInner = toCancelServer()
+  const cancelling = {
+    propfind: (path) => cancelInner.propfind(path),
+    options: () => cancelInner.options(),
+    get: async (path) => {
+      const body = await cancelInner.get(path)
+      if (String(path).endsWith('.ndjson.zst')) cancelReader.abort()
+      return body
+    },
+    put: (...args) => cancelInner.put(...args),
+    mkcol: (path) => cancelInner.mkcol(path),
+    move: (...args) => cancelInner.move(...args),
+    delete: (path) => cancelInner.delete(path),
+  }
+  cancelReader = new SyncEngine({ dataDir: storeRoot(cancelReaderHome), store: cancelReaderStore, client: cancelling, now: () => 52_100, instanceId: 'inst-cancel-r' })
+  cancelReader.save({ config: { ...credential, url: cancelServer.url, deviceId: 'cancel-reader' } })
+  const cancelled = await runAndRelease(cancelReader)
+  check('a cancel mid-pull reports aborted and still says the store moved', cancelled.result === 'aborted' && cancelled.storeChanged === true, JSON.stringify({ result: cancelled.result, storeChanged: cancelled.storeChanged, message: cancelled.message }).slice(0, 170))
+  check('...because those rows really are in the store', totalInput(cancelReaderStore) === 1234, String(totalInput(cancelReaderStore)))
+  cancelReaderStore.close()
+  cancelWriterStore.close()
+  await cancelServer.close()
+}
+
+{
+  // (b) a shard that holds fewer rows than its manifest names
+  const shortServer = await startFakeWebDav()
+  const toShortServer = () => new WebDavClient({ baseUrl: shortServer.url, username: 'alice', passwordHash: credential.ha1 })
+  const shortWriterHome = makeHome('engine-short-writer')
+  const shortWriterStore = openStore(shortWriterHome)
+  seed(shortWriterStore, '2026-07-07', 999, 'short-1')
+  const shortWriter = new SyncEngine({ dataDir: storeRoot(shortWriterHome), store: shortWriterStore, client: toShortServer(), now: () => 53_000, instanceId: 'inst-short-w' })
+  shortWriter.save({ config: { ...credential, url: shortServer.url, deviceId: 'short-writer' } })
+  const shortPublished = await runAndRelease(shortWriter)
+  check('the fixture device publishes its month', shortPublished.result === 'ok' && shortPublished.pushed === 1, JSON.stringify(shortPublished).slice(0, 120))
+  // The manifest now advertises two rows for a shard that holds one. The bytes and their hash are untouched,
+  // so the shard itself still verifies — the disagreement is between the claim and the payload.
+  const shortManifestPath = '/usage-badge/short-writer/index.json'
+  const shortManifest = JSON.parse(shortServer.state.files.get(shortManifestPath).toString('utf8'))
+  shortManifest.chunks['2026-07'].rows = 2
+  shortServer.state.files.set(shortManifestPath, Buffer.from(JSON.stringify(shortManifest)))
+
+  const shortReaderHome = makeHome('engine-short-reader')
+  const shortReaderStore = openStore(shortReaderHome)
+  const shortReader = new SyncEngine({ dataDir: storeRoot(shortReaderHome), store: shortReaderStore, client: toShortServer(), now: () => 53_100, instanceId: 'inst-short-r' })
+  shortReader.save({ config: { ...credential, url: shortServer.url, deviceId: 'short-reader' } })
+  const short = await runAndRelease(shortReader)
+  check('a shard holding fewer rows than its manifest names is reported, not trusted', short.result === 'partial' && short.rows === 0 && short.failed?.length === 1 && /rows its manifest names/.test(short.failed[0].error), JSON.stringify({ result: short.result, rows: short.rows, failed: short.failed }).slice(0, 190))
+  check('...while the rows it did hold are imported anyway', totalInput(shortReaderStore) === 999, String(totalInput(shortReaderStore)))
+  check('...and the cache-change flag is set even though no row was vouched for', short.storeChanged === true, JSON.stringify({ storeChanged: short.storeChanged }))
+  // Read again against a store that already holds them: nothing is written, so nothing is stale.
+  const shortReplay = await runAndRelease(shortReader)
+  check('a replay that writes nothing does not claim the cache moved', shortReplay.result === 'partial' && shortReplay.storeChanged === false, JSON.stringify({ result: shortReplay.result, storeChanged: shortReplay.storeChanged }))
+  shortReaderStore.close()
+  shortWriterStore.close()
+  await shortServer.close()
+}
+
 await finish()

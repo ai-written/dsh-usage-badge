@@ -17,7 +17,7 @@ import { join } from 'node:path'
 
 import { readLock } from '../lib/sync.js'
 import { startFakeWebDav } from './webdav-server.mjs'
-import { createChecker, makeHome, mount, DATA_DIR } from './helpers.mjs'
+import { createChecker, makeHome, mount, writeSession, DATA_DIR } from './helpers.mjs'
 
 const { check, finish } = createChecker('HOST SYNC VERIFY')
 
@@ -356,6 +356,83 @@ try {
   } finally {
     delete process.env.DSH_USAGE_BADGE_STARTUP_SYNC_MS
     await otherServer.close()
+  }
+}
+
+// ── 11. a pull lands in the panel without a restart (both cache backends) ────
+//
+// The sync writes rows straight into the cache. The fold is driven by log cursors, and a row that came
+// from another device has no log here to move one — so unless the host reloads its aggregate after the
+// run, the badge and the charts keep the numbers they had until the process restarts, while the sync
+// page (which reads `sync.json`) cheerfully reports "pulled 1 shard". Both directions are asserted below:
+// an imported month starts counting, and a month another device withdraws stops.
+//
+// **Both backends, in a loop.** They import the same way but answer "this session is empty now" with
+// different shapes (SQLite keeps the session row, the JSON document used to drop the entry), and the
+// reload *merges* what the store returns instead of replacing its world with it — so the withdrawal half
+// passed on SQLite and silently failed on the JSON fallback. One backend is not the contract.
+for (const kind of ['sqlite', 'json']) {
+  const previousBackend = process.env.DSH_USAGE_BADGE_CACHE
+  if (kind === 'json') process.env.DSH_USAGE_BADGE_CACHE = 'json'
+  else delete process.env.DSH_USAGE_BADGE_CACHE
+  const accumServer = await startFakeWebDav()
+  const now = Date.now()
+  const stamp = new Date(now)
+  const day = `${stamp.getFullYear()}-${String(stamp.getMonth() + 1).padStart(2, '0')}-${String(stamp.getDate()).padStart(2, '0')}`
+  const month = day.slice(0, 7)
+  /** Each "machine" needs its own persisted identity: in one process they would otherwise share hostname+pid. */
+  const seed = (home, instanceId) => {
+    mkdirSync(join(home, DATA_DIR), { recursive: true })
+    writeFileSync(join(home, DATA_DIR, 'sync.json'), JSON.stringify({ enabled: false, instanceId }))
+  }
+  const remoteHome = makeHome(`host-sync-accum-remote-${kind}`)
+  seed(remoteHome, `host-sync-accum-remote-${kind}`)
+  writeSession(remoteHome, 'session-on-remote', { provider: 'deepseek', model: 'deepseek-chat', time: now, input: 1111, output: 222 })
+  const localHome = makeHome(`host-sync-accum-local-${kind}`)
+  seed(localHome, `host-sync-accum-local-${kind}`)
+  process.env.DSH_USAGE_BADGE_STARTUP_SYNC_MS = '600000'
+  try {
+    const remote = await mount(remoteHome, `host-sync-accum-remote-${kind}-1`)
+    await remote.settle()
+    await remote.call('POST', '/usage-badge/sync', { enabled: true, url: accumServer.url, username: 'alice', password: 'secret1234', deviceId: 'accum-remote' })
+    const publish = await remote.call('POST', '/usage-badge/sync/run')
+    check(`${kind}: the other machine publishes its month`, publish.body.result === 'ok' && publish.body.pushed === 1, JSON.stringify(publish.body).slice(0, 120))
+
+    const local = await mount(localHome, `host-sync-accum-local-${kind}-1`)
+    await local.settle()
+    // The loop is only worth anything if the backend named here is the one in play: the host reads this
+    // from the environment, and a mistake there would run SQLite twice and call it coverage. (`cacheKind`
+    // rather than a file on disk: the JSON backend only writes its file once something changed.)
+    const cacheKind = (await local.call('GET', '/usage-badge/config')).body.paths.cacheKind
+    check(`${kind}: the host opened the cache backend this case is about`, cacheKind === kind, String(cacheKind))
+    const before = (await local.call('GET', '/usage-badge/summary')).body
+    check(`${kind}: a machine with no logs of its own starts empty`, before.today.input === 0 && before.days.length === 0, JSON.stringify({ input: before.today.input, days: before.days.length }))
+    await local.call('POST', '/usage-badge/sync', { enabled: true, url: accumServer.url, username: 'alice', password: 'secret1234', deviceId: 'accum-local' })
+    const pull = await local.call('POST', '/usage-badge/sync/run')
+    check(`${kind}: the pull imports the row`, pull.body.result === 'ok' && pull.body.pulled === 1 && pull.body.rows === 1, JSON.stringify(pull.body).slice(0, 140))
+    // **No remount anywhere in this block**: everything below is the same host process that did the pull.
+    const after = (await local.call('GET', '/usage-badge/summary')).body
+    check(`${kind}: the badge counts it without a restart`, after.today.input === 1111, JSON.stringify({ input: after.today.input, sessions: after.status.sessions }))
+    check(`${kind}: the day is in the window the charts read`, after.days.some((row) => row.date === day && row.input === 1111), JSON.stringify(after.days.map((row) => `${row.date}:${row.input}`)))
+    check(`${kind}: the year view agrees with it`, (await local.call('GET', `/usage-badge/year?year=${stamp.getFullYear()}`)).body.daily.some((row) => row.date === day && row.input === 1111), 'the year view does not show the imported day')
+
+    // The other half of the same hole: a withdrawn month is **deleted** from the store, so a host that only
+    // reloads on import would keep counting rows that are no longer there.
+    const manifestPath = '/usage-badge/accum-remote/index.json'
+    const manifest = JSON.parse(accumServer.state.files.get(manifestPath).toString('utf8'))
+    const withdrawnSha = manifest.chunks[month]?.sha256 ?? ''
+    delete manifest.chunks[month]
+    manifest.retired = { ...(manifest.retired ?? {}), [month]: { at: Date.now(), sha256: withdrawnSha } }
+    accumServer.state.files.set(manifestPath, Buffer.from(JSON.stringify(manifest)))
+    const second = await local.call('POST', '/usage-badge/sync/run')
+    const emptied = (await local.call('GET', '/usage-badge/summary')).body
+    check(`${kind}: a month the other machine withdraws stops counting without a restart`, second.body.dropped === 1 && emptied.today.input === 0, JSON.stringify({ dropped: second.body.dropped, input: emptied.today.input }))
+    check(`${kind}: ...leaving no day behind in the window`, emptied.days.length === 0, JSON.stringify(emptied.days.map((row) => row.date)))
+  } finally {
+    delete process.env.DSH_USAGE_BADGE_STARTUP_SYNC_MS
+    await accumServer.close()
+    if (previousBackend === undefined) delete process.env.DSH_USAGE_BADGE_CACHE
+    else process.env.DSH_USAGE_BADGE_CACHE = previousBackend
   }
 }
 

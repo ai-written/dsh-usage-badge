@@ -624,9 +624,10 @@ storages/usage-badge/sync.json         # 同步配置与状态
 
 - **来源维度**：`days` / `sessions` 增加一列来源（本设备 / 某个远端设备）。本地 fold 只能写本设备的行；远端导入的行**只读**，永不被本地 fold 波及 —— 否则「B 下载了 A 的历史，B 本地没有那些日志」会让 B 的下一轮 fold 把它们删光。
 - **导入远端行**时：若已存在同一 `(session, date)` 且那份的 `(maxSeq, fileSize)` 更大，则跳过（**旧机器不能覆盖新数据**）；否则写入。
-- **导入之后必须重载聚合器**：`refresh()` 的游标没变，不会自己发现库里的新行，否则同步来的历史要等到重启才可见。
+- **导入之后必须重载聚合器**：`refresh()` 的游标没变，不会自己发现库里的新行，否则同步来的历史要等到重启才可见。实现是 `runSync()` 里 `engine.run()` 返回之后的 `aggregator.loadCache({ quiet: true })` 加 `snapshot = null`，条件是引擎自己报的 **`storeChanged`**（真的是库里写进或删掉了行才为真，取值来自 `intakeRows()`/`dropSourceMonth()` 的返回值 —— 重放一份库里已经全有的分片写 0 行，就不该为此付一次全量重载，实测 16k 行的库一次约 0.9 秒）。宿主还要 `!system.syncAbort`：正在关闭的宿主不能去读一个马上要 close 的库（宽松条件实测会打印 `cache load failed: statement has been finalized`），而**因为别的原因被中止**（未来的「取消同步」）仍会重载，所以 `aborted` 分支也带上 `storeChanged`。**撤回（墓碑删行）走的是同一段**，否则「别人撤回了，你这里还在多算」会一直算到重启为止。`test/host-sync.verify.mjs` 的两个方向、**两个后端**都钉着。
+- **两个后端对「这个会话空了」必须给出同一种形状**：SQLite 的墓碑是 `DELETE FROM days`，`sessions` 行还在，于是 `load()` 返回一条**零行记录**；JSON 后端原先在最后一行被删时把整个 session 条目 `delete` 掉，`load()` 于是**少返回一条**。重载是 merge 语义（不能改成替换：只读库的 `put` 返回 null，内存里那次折叠是唯一的一份），它分不出「空了」和「从来没有过」——所以在 JSON 后端上墓碑撤回一直算到重启。现在 JSON 也保留空条目（`days: []`）。这是**只有两个后端都跑**才看得见的差异：契约套件（`cache.verify.mjs`）两个后端都跑却放过了它，因为它在「宿主重载」这一层，所以 `host-sync.verify.mjs` 也改成两个后端各跑一遍。
 - **「变短」要说出来**：折叠时若发现某会话的天数或总量变小，记一行日志、并在面板标一次「这段历史已脱离日志，缓存里仍保留」，让使用者能分辨「格式升级」和「真丢了东西」。
-- 读路径不变：`load()` 按窗口返回已 resolve 的记录；`按年` 仍是直接查库（[index.js:614-623](../lib/index.js#L614-L623)）。
+- 读路径不变：`load()` 按窗口返回已 resolve 的记录；`按年` 仍是直接查库（[index.js:1088-1099](../lib/index.js#L1088-L1099) —— 这条链接此前指向 `syncSystem()`，顺手改正）。
 
 ### 远端布局
 
@@ -787,9 +788,9 @@ storages/usage-badge/host.lock     # { pid, startedAt, instanceId, hostname, at 
 | `test/webdav.verify.mjs` ✅ **已实现（60 项）** | 纯函数：RFC 2617 向量（`Mufasa` 例子逐字段）、无 `qop` 的 RFC 2069 写法、`stale=true` 重试、UTF-8 与带逗号的 realm、`uri` 必须是请求行里的原始路径（含 `%XX`）；以及对着假服务端的端到端：七个方法、`MOVE` 的 `Overwrite: F` 保护、404 语义、错误密码 / 一直挑战 / `SHA-256` / `Basic`-only 的四种失败各自报对原因 |
 | `test/webdav-server.mjs` ✅ **已实现（harness）** | 一个**假 WebDAV 服务端**（`node:http`，真发 Digest 挑战并按 `MD5(HA1:nonce:nc:cnonce:qop:HA2)` 校验，检查 `nc` 不回退、`uri` 与请求行一致），可切换 `qop: null`、`staleOnce`、`challengeEveryRequest`、`algorithm`、`scheme` 等恶意行为 |
 | `test/sync.verify.mjs` ✅ **已实现** | 分片与两个方向：路径／键的卫生（设备 id 与 `YYYY-MM` 不能带斜杠或穿越）、分片往返（stamp 与桶逐项保留）、**`source` 被改写成发布设备**、版本不符的分片与清单被具名拒绝、只发布本机 `current` 行（`fallback` 与别人的行都不发）、内容 sha256 决定「未变的月不重传」、首次拉取的窗口只限制拉取、`rowsToRecords()` 取最全 stamp、以及一次完整 trip（导出 → 空库导入 → 数字逐项相同、且**再导入一次不写任何东西**）。行模型的语义（截断/回滚/跨来源/从不删）由 `cache.verify.mjs` 的 section 8/9 覆盖，不在这里重测 |
-| `test/sync-engine.verify.mjs` ✅ **已实现** | 端到端两设备：发布只带自己的月份、第二次运行不重传、另一台空库拉取后**数字与归属都对**、同一天两个设备相加、缺分片报 `partial` 且不记为已应用、补上后自动重试、owner 锁挡住第二个宿主、`sync.json` 里是 HA1 而非明文、以及**配置写入不会覆盖上一次的状态** |
+| `test/sync-engine.verify.mjs` ✅ **已实现** | 端到端两设备：发布只带自己的月份、第二次运行不重传、另一台空库拉取后**数字与归属都对**、同一天两个设备相加、缺分片报 `partial` 且不记为已应用、补上后自动重试、owner 锁挡住第二个宿主、`sync.json` 里是 HA1 而非明文、**配置写入不会覆盖上一次的状态**，以及三条「run 没走到 `ok`、但库里已经变了」的路径都报 `storeChanged`：**拉到行之后发布失败**、**分片在途中被中止（`aborted`）**、**分片行数比清单少（导入照做、失败照报）**；再加上「重放一份已经全有的分片写 0 行 ⇒ `storeChanged: false`」（宿主不必为此重载） |
 | `test/sync.live.mjs` ✅ **已实现（联网）** | 真实的 `bytemark/webdav` 容器上跑完整流水线：A 发布一天 → B 空库拉取并计数 → 再同步一次零传输 → 清理自己建的两个设备目录（**不删 `usage-badge/` 本身**）。URL / 账号 / 密码从环境变量取，缺失就跳过 |
-| `test/host-sync.verify.mjs` ✅ **已实现** | 宿主半的接线：挂载**不创建任何东西**、读状态不落文件、`POST /sync` 把明文算成 HA1 且**明文永不落盘**、响应只回前缀、patch 保存不丢别的字段、非法 URL / 非法设备 id 被拒、连不上的服务器**失败但不抛**、一次真实 run 走完整条路（发布 + 建目录 + 状态回填）、以及第二个实例拿到同一份配置但**被拒绝同步** |
+| `test/host-sync.verify.mjs` ✅ **已实现** | 宿主半的接线：挂载**不创建任何东西**、读状态不落文件、`POST /sync` 把明文算成 HA1 且**明文永不落盘**、响应只回前缀、patch 保存不丢别的字段、非法 URL / 非法设备 id 被拒、连不上的服务器**失败但不抛**、一次真实 run 走完整条路（发布 + 建目录 + 状态回填）、第二个实例拿到同一份配置但**被拒绝同步**、以及**另一台机器同步来的用量在同一次进程里就计入徽标与日窗口（不重启）**——撤回方向也一样，且**两个后端各跑一遍**（这条差异只在 JSON 回退上出现，见「本地缓存」一节） |
 | `test/sync-triggers.verify.mjs` ✅ **已实现** | 两条自动触发：没配过同步的 home **什么都不做**（不建 `sync.json`、不拿锁、不发请求）；配好并开启的 home 启动后**自己同步一次**（服务器上出现设备目录、状态记下那次运行）；改一次价格表会**自动发布**（带上那次编辑、带设备副本、且不拖任何分片工作）；服务器连不上时本地编辑**照样成功**、本地表照样生效 |
 | ⏳ **未做**：跨机同 `deviceId` 的 `instanceId` 报警 | 设计里写了、代码里还没接；本机并发的 owner 锁已经实现并测过 |
 | `test/webdav.live.mjs` ✅ **已实现（联网）** | 对着真实的 `bytemark/webdav` 容器跑：`OPTIONS`（打 realm 与 `DAV` 能力）→ `MKCOL` → `PUT` → `GET` 逐字节比对 → `PROPFIND` → `MOVE`（含撞名 412）→ `DELETE`，并在结尾清理自己创建的目录。URL / 账号 / 密码从环境变量取，缺失就跳过并打印怎么起容器 |
