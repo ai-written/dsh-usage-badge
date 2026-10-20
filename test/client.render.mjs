@@ -156,17 +156,26 @@ check('the row does not float over other controls', !/\.dub-pill\{[^}]*position:
 check('the rail variant is a square', /\.dub-pill-rail\{[^}]*width:36px;height:36px/.test(clientSource))
 check('dialog sits above the frame', /\.dub-mask\{[^}]*z-index:2147483/.test(clientSource))
 check('the chart tooltip has its own positioned layer', /\.dub-plot\{position:relative\}/.test(clientSource))
-// The bug this pins: DSH 0.1.7 changed --dsw-specific-menu from
-// var(--dsw-alias-bg-layer-3) — an opaque surface, which is what 0.1.6 defined — to
-// #f8f9fa94 in the light theme and #30313680 in the dark one. Those are frosted
-// surfaces: the shell pairs them with backdrop-filter:var(--dsw-menu-backdrop-filter),
-// so a rule that fills with the token and no blur reads as half transparent — the
-// dialog panel and the chart tooltip let the conversation behind them show through.
-// Both name the opaque layer token directly instead, which both versions define.
-check('the dialog panel keeps an opaque surface',
-  /\.dub-box\{[^}]*background:var\(--dsw-alias-bg-layer-3,#fff\)/.test(clientSource))
-check('the chart tooltip keeps an opaque surface',
-  /\.dub-tip\{[^}]*background:var\(--dsw-alias-bg-layer-3,#fff\)/.test(clientSource))
+// The panel used to fill with --dsw-alias-bg-layer-3, which was already fragile once: DSH 0.1.7
+// turned --dsw-specific-menu into a frosted rgba, and a rule that filled with it and no blur read as
+// half transparent (the dialog and the tooltip let the conversation behind them show through). Naming
+// the opaque layer token fixed that — until a **skin** redefined the layer token itself: Open Sea points
+// --dsw-alias-bg-layer-3 at rgba(…,40%–90%), and this panel went see-through with the code behind it
+// legible through the chart. Pinning one token's alpha would have been the next fragile version of the
+// same thing, so the panel carries its own palette now: literal colours under this plugin's own
+// --dub-* names, a dark variant keyed on the host's theme switch, and **no host colour token anywhere
+// in the dialog's CSS**. The sidebar row is deliberately not part of this — it has to blend in with the
+// host's own rows. Comments are stripped first: prose is allowed to name the tokens.
+const cssBlock = /const CSS = `([\s\S]*?)`\n/.exec(clientSource)?.[1] ?? ''
+const dialogCss = cssBlock.slice(cssBlock.indexOf('.dub-mask{')).replace(/\/\*[\s\S]*?\*\//g, '')
+check('the host’s colour tokens stop at the dialog’s edge',
+  dialogCss.includes('.dub-box{') && !/--dsw-/.test(dialogCss), 'a --dsw- token is still referenced inside the dialog')
+check('the dialog paints its own surface and ink',
+  /\.dub-box\{[^}]*background:var\(--dub-surface\)[^}]*color:var\(--dub-ink\)/.test(dialogCss))
+check('the chart tooltip paints its own surface', /\.dub-tip\{[^}]*background:var\(--dub-surface\)/.test(dialogCss))
+check('the panel defines its palette for the light theme', /\.dub-mask\{[^}]*--dub-surface:#fff/.test(dialogCss))
+check('...and a dark one behind the host’s theme switch',
+  /body\[data-ds-dark-theme\] \.dub-mask[^{]*\{[^}]*--dub-surface:/.test(dialogCss))
 check('no surface fills with the translucent menu token',
   !/background:var\(--dsw-specific-menu/.test(clientSource), 'menu surfaces need a backdrop blur')
 
@@ -193,13 +202,13 @@ check('the row shows the day token total', closedMarkup.includes('880.0K tokens'
     /\.dub-dot-peak\{background:var\(--dsw-static-amber-500,#f59e0b\)\}/.test(clientSource))
   check('no peak accent borrows the brand ink token',
     !/\.dub-(?:dot|chip)-peak\{[^}]*--dsw-alias-brand-primary/.test(clientSource) &&
-      /\.dub-chip-peak\{background:var\(--dsw-static-amber-500,#f59e0b\);color:#111\}/.test(clientSource),
+      /\.dub-chip-peak\{background:#f59e0b;color:#111\}/.test(clientSource),
     'amber on both, in both themes')
   // The same token is a foreground colour, so it cannot be a filled background under
   // white text either — in the dark theme that pairs near-white with white.
   check('the ink token is never a filled background under white text',
     !/background:var\(--dsw-alias-brand-primary[^}]*color:#fff/.test(clientSource) &&
-      /\.dub-btn-primary\{[^}]*background:var\(--dsw-static-deepseek-500,#4176e6\);color:#fff\}/.test(clientSource),
+      /\.dub-btn-primary\{[^}]*background:#4176e6;color:#fff\}/.test(clientSource),
     'the apply button keeps a readable pair')
 }
 check('the rail variant hides the extra fields',
