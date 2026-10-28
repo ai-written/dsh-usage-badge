@@ -4,6 +4,8 @@ DeepSeek Harness 的用量徽标插件：侧边栏底部一行「今日用量」
 
 ![侧边栏底部的「今日用量」行与用量弹窗](assets/usage-dialog.png)
 
+[![Awesome DSH Plugin](https://awesome-dsh-plugin.com/badge.svg)](https://awesome-dsh-plugin.com)
+
 零依赖、零构建：宿主半只用 Node 内建模块，浏览器半是手写的单文件 bundle，折线图是手写 SVG。
 
 ## 安装
