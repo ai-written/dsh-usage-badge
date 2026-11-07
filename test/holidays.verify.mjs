@@ -71,10 +71,13 @@ async function dayFor(scenario, dateKey, moment, holidays) {
   const { calendar } = await summaryFor(root, 'calendar').then((snapshot) => ({ calendar: snapshot.calendar }))
 
   check('calendar is on', calendar.enabled)
-  check('calendar covers 2025 and 2026', calendar.years.includes('2025') && calendar.years.includes('2026'), calendar.years.join(','))
+  check('calendar covers 2025, 2026 and 2027',
+    ['2025', '2026', '2027'].every((year) => calendar.years.includes(year)), calendar.years.join(','))
   check('2026 is not reported missing', !calendar.missingYears.includes('2026'), calendar.missingYears.join(','))
+  check('2027 is not reported missing', !calendar.missingYears.includes('2027'), calendar.missingYears.join(','))
   // 2025: 1+8+3+5+3+8 = 28 holidays, 5 调休 workdays. 2026: 3+9+3+5+3+3+7 = 33, 6.
-  check('the expanded calendar holds 61 holidays', calendar.counts.holidays === 61, String(calendar.counts.holidays))
+  // 2027: 3+9+3+5+1+1+7 = 29, 5.
+  check('the expanded calendar holds 90 holidays', calendar.counts.holidays === 90, String(calendar.counts.holidays))
   // The 调休 dates are recorded for audit but are not a pricing input, so they must
   // not appear as a resolved rule.
   check('the resolved rules carry no 调休 working days', calendar.counts.workdays === undefined, JSON.stringify(calendar.counts))
@@ -86,7 +89,14 @@ async function dayFor(scenario, dateKey, moment, holidays) {
   check('the 2026 holiday dates are present', expectHoliday.every((date) => table.holidays.includes(date)), expectHoliday.filter((d) => !table.holidays.includes(d)).join(','))
   const expectWorkday = ['2026-01-04', '2026-02-14', '2026-02-28', '2026-05-09', '2026-09-20', '2026-10-10']
   check('the 2026 调休 workdays are present', expectWorkday.every((date) => table.workdays.includes(date)), expectWorkday.filter((d) => !table.workdays.includes(d)).join(','))
-  check('the calendar records its source documents', Boolean(table.source?.['2026']?.url && table.source?.['2025']?.url), JSON.stringify(Object.keys(table.source ?? {})))
+  // The 2027 notice (国办发明电〔2026〕10号, published 2026-11-05) is the newest one the
+  // table carries; 端午 and 中秋 are single weekday days that year, which is exactly the
+  // case the calendar exists for.
+  const expectHoliday2027 = ['2027-01-01', '2027-02-05', '2027-02-13', '2027-04-05', '2027-05-05', '2027-06-09', '2027-09-15', '2027-10-01', '2027-10-07']
+  check('the 2027 holiday dates are present', expectHoliday2027.every((date) => table.holidays.includes(date)), expectHoliday2027.filter((d) => !table.holidays.includes(d)).join(','))
+  const expectWorkday2027 = ['2027-01-31', '2027-02-14', '2027-05-08', '2027-09-26', '2027-10-09']
+  check('the 2027 调休 workdays are present', expectWorkday2027.every((date) => table.workdays.includes(date)), expectWorkday2027.filter((d) => !table.workdays.includes(d)).join(','))
+  check('the calendar records its source documents', Boolean(table.source?.['2026']?.url && table.source?.['2025']?.url && table.source?.['2027']?.url), JSON.stringify(Object.keys(table.source ?? {})))
 }
 
 // ── 2. a weekday holiday is off-peak all day ─────────────────────────────────
@@ -130,6 +140,29 @@ async function dayFor(scenario, dateKey, moment, holidays) {
 
   const makeup = await dayFor('spring-makeup', key(2026, 2, 14), at(2026, 2, 14, 10, 30), { source: 'cn' })
   check('the 2026-02-14 调休 Saturday stays off-peak (x1)', close(makeup.amount, 1000), `${makeup.amount}`)
+}
+
+// ── 4b. the 2027 notice: single weekday holidays ─────────────────────────────
+// 2027 gives 端午 and 中秋 one plain Wednesday each (06-09 and 09-15), so they are the
+// purest test of the calendar: the same hour is peak on the Wednesday beside them and
+// off-peak on the day itself.
+{
+  const dragonBoat = await dayFor('dragon-boat-2027', key(2027, 6, 9), at(2027, 6, 9, 10, 30), { source: 'cn' })
+  check('端午 2027-06-09 (a Wednesday) is off-peak all day', close(dragonBoat.amount, 1000), `${dragonBoat.amount}`)
+  check('端午 is named on its row', dragonBoat.row.dayName === '端午节', String(dragonBoat.row.dayName))
+
+  const nextWednesday = await dayFor('plain-wednesday-2027', key(2027, 6, 16), at(2027, 6, 16, 10, 30), { source: 'cn' })
+  check('the Wednesday after it is still peak (x2)', close(nextWednesday.amount, 2000), `${nextWednesday.amount}`)
+
+  const midAutumn = await dayFor('mid-autumn-2027', key(2027, 9, 15), at(2027, 9, 15, 10, 30), { source: 'cn' })
+  check('中秋 2027-09-15 (a Wednesday) is off-peak all day', close(midAutumn.amount, 1000), `${midAutumn.amount}`)
+
+  // 2027's 春节 runs 02-05 … 02-13 with 02-14 (a Sunday) as a 调休 working day; the
+  // Sunday is still a 周末, so it stays off-peak.
+  const spring = await dayFor('spring-festival-2027', key(2027, 2, 9), at(2027, 2, 9, 10, 30), { source: 'cn' })
+  check('春节 2027-02-09 (a Tuesday) is off-peak all day', close(spring.amount, 1000), `${spring.amount}`)
+  const springMakeup = await dayFor('spring-makeup-2027', key(2027, 2, 14), at(2027, 2, 14, 10, 30), { source: 'cn' })
+  check('the 2027-02-14 调休 Sunday stays off-peak (x1)', close(springMakeup.amount, 1000), `${springMakeup.amount}`)
 }
 
 // ── 5. custom calendars ──────────────────────────────────────────────────────

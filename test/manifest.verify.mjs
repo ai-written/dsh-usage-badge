@@ -111,7 +111,8 @@ check('the published file list ships every referenced directory',
 const table = JSON.parse(read('lib/holidays-cn.json'))
 const years = Object.keys(table.years ?? {})
 check('the holiday table ships inside the published lib/', files.includes('lib'))
-check('the holiday table covers 2025 and 2026', years.includes('2025') && years.includes('2026'), years.join(','))
+check('the holiday table covers 2025, 2026 and 2027',
+  ['2025', '2026', '2027'].every((year) => years.includes(year)), years.join(','))
 check('every holiday block has a name and an in-range span',
   years.every((year) => table.years[year].blocks.every((block) => block.name && /^\d{4}-\d{2}-\d{2}$/.test(block.from) && block.from <= block.to)),
   'blocks are well formed')

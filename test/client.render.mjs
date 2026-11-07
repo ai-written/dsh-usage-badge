@@ -319,8 +319,10 @@ check('provider tabs match the snapshot', providers.length <= 1
 // ── 6. the holiday calendar reaches the UI ───────────────────────────────────
 check('the snapshot carries a calendar', Boolean(snapshot.calendar?.today), JSON.stringify(snapshot.calendar?.today))
 check('config panel shows the holiday block', configMarkup.includes('法定节假日日历'))
+// The panel names whatever years the bundled table carries, so the assertion follows
+// the data rather than pinning a year list that goes stale every November.
 check('config panel reports what the bundled table covers',
-  configMarkup.includes('覆盖 2025、2026') && configMarkup.includes('法定节假日'),
+  config.bundled?.years?.length > 0 && configMarkup.includes(`覆盖 ${config.bundled.years.join('、')}`) && configMarkup.includes('法定节假日'),
   config.bundled?.years?.join(','))
 check('config panel says 调休 workdays do not change pricing', configMarkup.includes('不影响计价'))
 check('config panel names the source documents', configMarkup.includes('国办发明电'), 'source documents live in the tooltip')
