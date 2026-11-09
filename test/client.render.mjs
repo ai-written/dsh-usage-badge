@@ -224,6 +224,24 @@ check('the rail variant hides the extra fields',
     atLabel >= 0 && atDot > atLabel && atTokens > atDot && atAmount > atTokens,
     `${atLabel} < ${atDot} < ${atTokens} < ${atAmount}`)
 }
+{
+  // Regression: on a day with no usage there is no token text, and the amount slid left
+  // to sit right beside the label — one row, two different alignments. The token span is
+  // what owns `margin-left:auto`, so it has to be rendered even when it is empty (an
+  // empty flex item still absorbs the free space, a missing one absorbs nothing).
+  const idle = { ...snapshot, today: { ...snapshot.today, input: 0, cacheRead: 0, cacheWrite: 0, output: 0 } }
+  const idleMarkup = render({ initialSnapshot: idle })
+  check('an idle day still renders an empty token slot',
+    idleMarkup.includes('<span class="dub-pill-tokens"></span>'), 'the slot is present but blank')
+  check('an idle day keeps the amount last in the row',
+    idleMarkup.indexOf('dub-pill-tokens') >= 0 &&
+      idleMarkup.indexOf('dub-pill-tokens') < idleMarkup.indexOf('dub-pill-amount'),
+    'label → dot → (blank) tokens → amount')
+  check('exactly one auto margin pushes the row right',
+    /\.dub-pill-tokens\{margin-left:auto/.test(clientSource) &&
+      !/\.dub-pill-amount\{[^}]*margin-left:auto/.test(clientSource),
+    'two auto margins would split the free space and park the token text mid-row')
+}
 
 // ── 5. render: the 用量 panel ────────────────────────────────────────────────
 check('dialog renders its title', openMarkup.includes('用量统计'))
