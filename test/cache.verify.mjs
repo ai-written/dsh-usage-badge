@@ -15,7 +15,7 @@
  *   node test/cache.verify.mjs
  */
 
-import { chmodSync, mkdirSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from 'node:fs'
+import { appendFileSync, chmodSync, mkdirSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import { createHash } from 'node:crypto'
 import { join } from 'node:path'
 
@@ -476,6 +476,98 @@ for (const kind of ['sqlite', 'json']) {
   )
   check('host: the deleted session is still counted', after.status.sessions === 1, String(after.status.sessions))
   check('host: the day still carries its tokens', after.today.input === 1000, String(after.today.input))
+}
+
+// ── 5b. a growing log is folded from its tail, not from the start ───────────
+//
+// The measured failure this pins: every start re-folded whole logs. A session's cursor used to be
+// read off its **oldest day row** (which keeps the stamp of the fold that wrote it), so a
+// long-lived session always looked changed — and even when it really had changed, the whole log
+// was decoded again. On a real home that cost 3.6 s per start (25 grown logs) and 20 s cold, all
+// of it zstd decompression: 12.7 MB took 775 ms to decode against 133 ms of `JSON.parse`.
+{
+  const root = makeHome('tail-fold')
+  writePricing(root, {
+    exchangeRate: 6.74,
+    totalCurrency: 'cny',
+    multiplier: 1,
+    default: { inputPerMillion: 1e6, cacheReadPerMillion: 0, cacheWritePerMillion: 0, outputPerMillion: 0, currency: 'cny' },
+    overrides: {},
+  })
+  // Day one is *yesterday*, so a later fold has no reason to rewrite that day's row — which is the
+  // case whose stamp used to become the session cursor.
+  writeSession(root, 'grower', { provider: 'p', model: 'm', time: Date.now() - 26 * 3_600_000, input: 1000 })
+  const logPath = join(root, 'sessions', 'grower', 'session.jsonl')
+  const total = (snapshot) => snapshot.days.reduce((sum, day) => sum + day.amount, 0)
+
+  const first = await summaryFor(root, 'tail-fold')
+  check('tail: the first pass folds the whole log', first.status.folded === 1 && first.status.tailed === 0, JSON.stringify({ folded: first.status.folded, tailed: first.status.tailed }))
+
+  // A second day of usage, appended the way a running session appends: whole lines.
+  const beforeAppend = statSync(logPath).size
+  const appended = [
+    { seq: 3, time: Date.now() - 3_600_000, type: 'request/context', data: { provider: 'p', model: 'm' } },
+    { seq: 4, time: Date.now() - 3_600_000, type: 'assistant/message', data: { usage: { inputTokens: 2000 } } },
+  ]
+    .map((event) => JSON.stringify(event))
+    .join('\n')
+  appendFileSync(logPath, `\n${appended}\n`)
+  const appendedBytes = statSync(logPath).size - beforeAppend
+
+  // A fresh mount is what a host restart does, so this reads the cursor back from disk.
+  const second = await summaryFor(root, 'tail-fold-restart')
+  check(
+    'tail: a restart folds only the bytes that were appended',
+    second.status.tailed === 1 && second.status.bytesRead === appendedBytes,
+    `tailed ${second.status.tailed}, read ${second.status.bytesRead} of ${statSync(logPath).size} bytes (appended ${appendedBytes})`,
+  )
+  check('tail: the two days add up instead of doubling', total(second) === 3000, `amounts ${second.days.map((day) => day.amount).join(',')}`)
+
+  const third = await summaryFor(root, 'tail-fold-restart-2')
+  check(
+    'tail: a restart with nothing new reads nothing at all',
+    third.status.folded === 0 && third.status.bytesRead === 0,
+    `folded ${third.status.folded}, read ${third.status.bytesRead}`,
+  )
+
+  // The cursor is the **log version**, not the stamp of the session's oldest day.
+  const store = createCacheStore({ dir: storeRoot(root), log: () => {} })
+  const loaded = store.load().find((record) => record.sessionId === 'grower')
+  store.close()
+  check(
+    'tail: the stored cursor is the log size, not an old day stamp',
+    loaded?.fileSize === statSync(logPath).size,
+    `cursor ${loaded?.fileSize} vs log ${statSync(logPath).size}`,
+  )
+
+  // A torn append — the appender caught mid-write — must not be folded half way, and must be
+  // folded exactly once when it completes.
+  appendFileSync(logPath, '{"seq":5,"time":' + String(Date.now() - 60_000))
+  const torn = await summaryFor(root, 'tail-fold-torn')
+  check('tail: a half-written line is not counted yet', total(torn) === 3000, `amounts ${torn.days.map((day) => day.amount).join(',')}`)
+  check('tail: a torn tail costs nothing to leave alone', torn.status.bytesRead === 0, `read ${torn.status.bytesRead} bytes`)
+
+  appendFileSync(logPath, ',"type":"assistant/message","data":{"usage":{"inputTokens":4000}}}\n')
+  const healed = await summaryFor(root, 'tail-fold-healed')
+  check('tail: once the line completes it is folded exactly once', total(healed) === 7000, `amounts ${healed.days.map((day) => day.amount).join(',')}`)
+
+  // An append that carries an *older* day is not the append-only file a tail fold assumes — a log
+  // rewritten in place looks like this. It is folded from the start instead, so the older day is
+  // counted once rather than twice.
+  const backwards = [
+    { seq: 6, time: Date.now() - 30 * 3_600_000, type: 'request/context', data: { provider: 'p', model: 'm' } },
+    { seq: 7, time: Date.now() - 30 * 3_600_000, type: 'assistant/message', data: { usage: { inputTokens: 500 } } },
+  ]
+    .map((event) => JSON.stringify(event))
+    .join('\n')
+  appendFileSync(logPath, `\n${backwards}\n`)
+  const stale = await summaryFor(root, 'tail-fold-backwards')
+  check(
+    'tail: an append carrying an older day is re-folded from the start',
+    stale.status.tailed === 0 && stale.status.folded === 1,
+    JSON.stringify({ tailed: stale.status.tailed, folded: stale.status.folded }),
+  )
+  check('tail: ...and that day is not counted twice', total(stale) === 7500, `amounts ${stale.days.map((day) => day.amount).join(',')}`)
 }
 
 // ── 6. the JSON fallback still runs the whole plugin ────────────────────────
