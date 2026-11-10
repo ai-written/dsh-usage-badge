@@ -13,6 +13,15 @@ import { join } from 'node:path'
 
 const homes = []
 
+/**
+ * The host half does its work on the first request, with a **fallback timer** (`STARTUP_WARM_DELAY_MS`)
+ * for a host nobody is looking at. A test wants the deterministic ordering it had before — mount, warm,
+ * then assert — so the fallback is set to fire immediately for every mount this harness makes.
+ * `cache.verify.mjs` sets it back to something long in the two tests that pin the ordering itself (a
+ * mount that has not folded yet must say so, and mounting must not touch the disk at all).
+ */
+if (process.env.DSH_USAGE_BADGE_WARM_MS === undefined) process.env.DSH_USAGE_BADGE_WARM_MS = '0'
+
 /** Disposers of every mounted plugin, so a home's files are not held open when it is removed. */
 const disposers = []
 

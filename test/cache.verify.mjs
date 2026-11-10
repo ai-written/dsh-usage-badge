@@ -15,7 +15,7 @@
  *   node test/cache.verify.mjs
  */
 
-import { appendFileSync, chmodSync, mkdirSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from 'node:fs'
+import { appendFileSync, chmodSync, existsSync, mkdirSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import { createHash } from 'node:crypto'
 import { join } from 'node:path'
 
@@ -568,6 +568,89 @@ for (const kind of ['sqlite', 'json']) {
     JSON.stringify({ tailed: stale.status.tailed, folded: stale.status.folded }),
   )
   check('tail: ...and that day is not counted twice', total(stale) === 7500, `amounts ${stale.days.map((day) => day.amount).join(',')}`)
+}
+
+// ── 5c. the first fold steps out of the host's boot path ────────────────────
+//
+// Mounting a plugin happens inside DSH's own startup, so the host half now waits a moment and does
+// its reading there instead (and the panel reports how long each phase took). What must not happen is
+// the old failure mode: a mount that has not folded yet must not *look* like a home with no usage.
+{
+  const root = makeHome('boot-delay')
+  writePricing(root, {
+    exchangeRate: 6.74,
+    totalCurrency: 'cny',
+    multiplier: 1,
+    default: { inputPerMillion: 1e6, cacheReadPerMillion: 0, cacheWritePerMillion: 0, outputPerMillion: 0, currency: 'cny' },
+    overrides: {},
+  })
+  writeSession(root, 's', { provider: 'p', model: 'm', time: Date.now() - 60_000, input: 1000 })
+
+  const previous = process.env.DSH_USAGE_BADGE_WARM_MS
+  process.env.DSH_USAGE_BADGE_WARM_MS = '150'
+  try {
+    const host = await mount(root, 'boot-delay')
+    const before = (await host.call('GET', '/usage-badge/config')).body
+    check('boot: a mount that has not folded yet says so', before.boot?.readyAt === 0, JSON.stringify(before.boot))
+    // The wait is the plugin's own choice, so the test has to sit through it.
+    await new Promise((resolve) => setTimeout(resolve, 220))
+    await host.settle()
+    const after = (await host.call('GET', '/usage-badge/config')).body
+    check(
+      'boot: the fold lands on its own, with the phases recorded',
+      after.boot?.readyAt > 0 && after.boot.folded === 1 && Number.isFinite(after.boot.loadMs) && Number.isFinite(after.boot.foldMs),
+      JSON.stringify(after.boot),
+    )
+    check(
+      'boot: the deliberate wait is reported apart from the work it delays',
+      after.boot.waitedMs >= 100 && after.boot.passMs >= after.boot.loadMs + after.boot.listMs,
+      JSON.stringify(after.boot),
+    )
+  } finally {
+    if (previous === undefined) delete process.env.DSH_USAGE_BADGE_WARM_MS
+    else process.env.DSH_USAGE_BADGE_WARM_MS = previous
+  }
+}
+
+// ── 5d. mounting the plugin does nothing at all ──────────────────────────────
+//
+// Mounting happens inside DSH's own startup, so `apply()` must not touch the disk. Everything the
+// plugin needs is opened on the first request — which cannot arrive before the harness is up. This
+// pins that literally: after a mount, the plugin's data directory does not even hold a cache file.
+{
+  const root = makeHome('lazy-mount')
+  writePricing(root, {
+    exchangeRate: 6.74,
+    totalCurrency: 'cny',
+    multiplier: 1,
+    default: { inputPerMillion: 1e6, cacheReadPerMillion: 0, cacheWritePerMillion: 0, outputPerMillion: 0, currency: 'cny' },
+    overrides: {},
+  })
+  writeSession(root, 's', { provider: 'p', model: 'm', time: Date.now() - 60_000, input: 1000 })
+
+  const previous = process.env.DSH_USAGE_BADGE_WARM_MS
+  // Effectively no fallback for the length of this test: the mount is observed before anything runs.
+  process.env.DSH_USAGE_BADGE_WARM_MS = '600000'
+  try {
+    const host = await mount(root, 'lazy-mount')
+    check(
+      'lazy: mounting writes nothing into the data directory',
+      !existsSync(join(storeRoot(root), 'cache.sqlite')) && !existsSync(join(storeRoot(root), 'cache.json')),
+      existsSync(storeRoot(root)) ? readdirSync(storeRoot(root)).join(',') : '(no data directory yet)',
+    )
+    const before = (await host.call('GET', '/usage-badge/config')).body
+    check('lazy: ...and it has not folded anything yet', before.boot?.readyAt === 0, JSON.stringify(before.boot))
+
+    // The interface's first request is what starts the work.
+    const first = (await host.call('GET', '/usage-badge/summary')).body
+    check('lazy: the first request folds the logs', first.status?.folded === 1 && first.today.amount === 1000, JSON.stringify({ folded: first.status?.folded, amount: first.today?.amount }))
+    const after = (await host.call('GET', '/usage-badge/config')).body
+    check('lazy: ...and only then does the cache exist', existsSync(join(storeRoot(root), 'cache.sqlite')) && after.boot.readyAt > 0, JSON.stringify({ cache: existsSync(join(storeRoot(root), 'cache.sqlite')), readyAt: after.boot?.readyAt }))
+    check('lazy: the boot report says how long the interface took to ask', after.boot.waitedMs >= 0 && after.boot.mountedAt > 0, JSON.stringify(after.boot))
+  } finally {
+    if (previous === undefined) delete process.env.DSH_USAGE_BADGE_WARM_MS
+    else process.env.DSH_USAGE_BADGE_WARM_MS = previous
+  }
 }
 
 // ── 6. the JSON fallback still runs the whole plugin ────────────────────────
